@@ -1,0 +1,27 @@
+# ============================================================================
+#  WiFi 配置模板（可选）
+# ============================================================================
+#  多数情况下用不到：相机先用米家 App 配好 WiFi 即可，配置会存在设备里。
+#
+#  如果你想让这张 SD 卡直接带上 WiFi 配置（例如给别人用、或 App 配网失败）：
+#    1. 改好下面的 ssid / psk
+#    2. 把本文件改名为  wpa_supplicant.conf1
+#    3. 放到 SD 卡**根目录**（不是 hack/ 里）
+#    4. 插卡开机
+#
+#  注意：一旦存在 wpa_supplicant.conf1，每次开机都会用它覆盖设备里的
+#        /home/wpa_supplicant.conf。改了 WiFi 密码记得同步改这里，
+#        否则请把这个文件删掉或改名。
+# ============================================================================
+
+ctrl_interface=/var/run/wpa_supplicant
+ap_scan=1
+network={
+ssid="你的WiFi名称"
+scan_ssid=1
+proto=WPA RSN
+key_mgmt=WPA-PSK
+pairwise=CCMP TKIP
+group=CCMP TKIP
+psk="你的WiFi密码"
+}

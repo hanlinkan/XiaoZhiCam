@@ -1,0 +1,19 @@
+# 统一换行符：仓库内一律 LF，避免 shell 脚本在 Linux 上因 CR 报 bad interpreter
+* text=auto eol=lf
+
+*.sh    text eol=lf
+*.c     text eol=lf
+*.h     text eol=lf
+*.cc    text eol=lf
+*.py    text eol=lf
+*.md    text eol=lf
+*.yaml  text eol=lf
+*.yml   text eol=lf
+Makefile text eol=lf
+
+# 二进制文件，不做换行符转换、不做 diff
+*.bin   binary
+*.wav   binary
+*.tflite binary
+*.jpg   binary
+*.png   binary

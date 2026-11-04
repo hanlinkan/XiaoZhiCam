@@ -1,0 +1,35 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  host-harness:
+    name: 主机侧工装构建与金标校验
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 构建 kws_host（与固件同一份源码）
+        run: make -C src/kws/test
+
+      - name: 网络层金标校验
+        run: |
+          cd src/kws/test
+          mkdir -p out
+          ./kws_host prob golden/frames.bin out/c.prob
+          test -s out/c.prob
+
+      - name: 参考实现构建（C++ 对拍基准）
+        run: make -C src/kws/test ref
+
+      - name: 检查 C 源码在严格警告下无新问题
+        run: |
+          cc -std=gnu99 -Wall -Wextra -fsyntax-only \
+             -Isrc/kws -Isrc/kws/mf \
+             -Isrc/kws/mf/tensorflow/lite/experimental/microfrontend/lib \
+             -Isrc/tests \
+             src/kws/kws.c src/kws/kws_mel.c src/kws/kws_mww.c \
+             src/kws/kws_level.c src/kws/kws_resamp.c

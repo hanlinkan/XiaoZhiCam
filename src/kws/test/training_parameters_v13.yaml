@@ -1,0 +1,126 @@
+# microWakeWord v9 —— 训练特征与部署的**连续流**对齐（前置 2 s 真实底噪预热）
+#
+# v8 之前所有版本都有同一个隐性缺陷：训练时每个 3.2 s 片段都从"冷启动"状态
+# 提特征，而设备上 KWS 是一条不停歇的流。实测同一段音频两种状态的特征
+# 前 50 帧平均差 7.4（收敛后降到 0.5），即前 ~1.5 s 完全不是一个分布。
+# 结果就是 v6~v8 在真机连续流上误触发 50~180 次/小时，而离线窗口评估看起来正常。
+#
+# 现在特征生成时给每个片段前置 2 s 真机底噪，已实测：带预热窗口与连续流
+# **逐位相同**（平均差 0.000、相关 1.000000，仅差 mel 预热的 2 帧偏移）。
+#
+# 负样本新增：30 分钟真机房间底噪（p21_noisecap 录制，连续提特征后切窗口）
+#
+# 与 v2 的唯一区别：**特征由固件的 C 代码产生**（afe -> 电平归一化 -> 8k→16k -> mel），
+# 而不是训练侧的 pymicro。
+#
+# 为什么必须这样：同一个「你好小智」，走训练链路模型给 255，走部署链路只给 105
+# （等于静音）。8 段真人录音里有 3 段是这么没的。模型不认识的是这条信号链。
+# 详见 docs/06-kws-engine-p1.md 与 mww_deploy_features.py 的注释。
+#
+# 模型结构一字未改（mixednet / 26k 参数 / stride 3），所以固件那份 int8 推理引擎、
+# 导出脚本、make verify 的逐位比对全部可以原样复用。
+
+window_step_ms: 10
+train_dir: ./data/trained_models/wakeword_v13
+
+features:
+  # TTS 合成（560 条 × 3 遍增强）
+  - features_dir: ./data/features_v9_tts
+    sampling_weight: 2.0
+    penalty_weight: 1.0
+    truth: true
+    truncation_strategy: truncate_start
+    type: mmap
+
+  # 真人真词（48 条 × 8 遍增强）
+  - features_dir: ./data/features_v9_real
+    sampling_weight: 3.0
+    penalty_weight: 1.0
+    truth: true
+    truncation_strategy: truncate_start
+    type: mmap
+
+  # 真实底噪 + 真实闲聊（33 条 × 40 遍增强）—— 没有现成的 dinner_party 音频
+  # （机器上只有旧链路的特征），所以用相机房间底噪和真实闲聊重建
+  - features_dir: ./data/features_v9_oldneg
+    sampling_weight: 10.0
+    penalty_weight: 1.0
+    truth: false
+    truncation_strategy: random
+    type: mmap
+
+  # 30 分钟真机房间底噪（连续提特征后切 3.2 s 窗口，约 1100 条）
+  - features_dir: ./data/features_v9_noise
+    sampling_weight: 10.0
+    penalty_weight: 1.0
+    truth: false
+    truncation_strategy: random
+    type: mmap
+
+  # 近音硬负样本（162 条 piper 合成：同音字/少字多字/同节奏换名/其它唤醒词）
+  - features_dir: ./data/features_v9_hardneg
+    sampling_weight: 10.0
+    penalty_weight: 1.0
+    truth: false
+    truncation_strategy: random
+    type: mmap
+
+  # 指令合成负样本（498 条 piper × 3 遍：讲个故事/查天气/智能家居/闲聊）
+  - features_dir: ./data/features_v13_cmdneg
+    sampling_weight: 10.0
+    penalty_weight: 1.0
+    truth: false
+    truncation_strategy: random
+    type: mmap
+
+  # 真机指令负样本（600s 实录：讲个故事/问天气等，无唤醒词）
+  - features_dir: ./data/features_v13_fpamb
+    sampling_weight: 10.0
+    penalty_weight: 1.0
+    truth: false
+    truncation_strategy: random
+    type: mmap
+
+  # 仅用于验证/测试的环境音（真机指令 + 房间底噪）——FAP 选权重用
+  - features_dir: ./data/features_v13_ambient
+    sampling_weight: 0.0
+    penalty_weight: 1.0
+    truth: false
+    truncation_strategy: split
+    type: mmap
+
+training_steps:
+  - 12000
+learning_rates:
+  - 0.001
+batch_size: 128
+eval_step_interval: 500
+clip_duration_ms: 1500
+spectrogram_length: 204
+spectrogram_length_final_layer: 50
+stride: 3
+negative_class_weight:
+  - 20
+positive_class_weight:
+  - 1
+target_minimization: 2.0
+minimization_metric: ambient_false_positives_per_hour
+maximization_metric: average_viable_recall
+
+flags:
+  model_name: mixednet
+  first_conv_filters: 32
+  first_conv_kernel_size: 5
+  pointwise_filters: 64,64,64,64
+  mixconv_kernel_sizes: '[5], [7,11], [9,15], [23]'
+  repeat_in_block: 1, 1, 1, 1
+  residual_connection: 0,0,0,0
+  max_pool: 0
+  spatial_attention: 0
+  pooled: 0
+  restore_checkpoint: 0
+  test_tf_nonstreaming: 0
+  test_tflite_nonstreaming: 0
+  test_tflite_nonstreaming_quantized: 0
+  test_tflite_streaming: 0
+  test_tflite_streaming_quantized: 1

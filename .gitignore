@@ -1,0 +1,61 @@
+# ---- 构建产物 ----
+*.o
+*.a
+*.so
+*.elf
+*.bin
+kws_host
+ref_sim
+out/
+build/
+
+# ---- 音频素材：仓库不分发任何录音 ----
+# 例外：hack/voice/*.pcm 是验证码播报用的合成数字音（edge-tts 生成，
+# 不含人声录音），随分发包一起提供。
+*.wav
+*.pcm
+*.raw
+*.opus
+*.g726
+!src/kws/test/golden/frames.bin
+!hack/voice/*.pcm
+
+# ---- 训练数据与模型产物（体积大、许可受限）----
+data/
+features_*/
+trained_models/
+*.tflite
+*.h5
+*.data-00000-of-00001
+*.index
+*.ckpt*
+aishell*
+
+# ---- 厂商 SDK / 工具链 / 固件：不得入库 ----
+hisi_mpp/
+toolchains/
+third_party/opus-*/
+third_party/mbedtls-*/
+fw_backup/
+*.ko
+*.tar.gz
+*.tgz
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+
+# ---- 编辑器 / 系统 ----
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.swp
+*~
+.git-rewrite/
+
+# 主程序编译产物（在 src/tests 下 make p8_client 生成）
+src/tests/p8_client

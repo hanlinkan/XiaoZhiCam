@@ -1,0 +1,119 @@
+# v17 —— 先有评测闭环，再重训（数据全部可复现，无真人录制）
+#
+# 与 v16 的区别：
+#   1. 只引用**当前开发机上真实存在**的特征目录。v16 配置引用的
+#      features_v9_* / v12_* / v13_* 六个目录早已被清理，直接重训会静默跳过
+#      大部分素材（verify_training_data.py 体检：正样本 training = 0）。
+#   2. 正样本改为 8 个 edge-tts 中文音色（其中 2 个留出只进 testing），
+#      不再依赖单一 piper 音色 + 48 条真人录音。
+#   3. 负样本新增 AISHELL-1 多说话人语料（50 人 × 60 条，按人分组），
+#      并按用户结论去掉 162 条近音词硬负样本（历史上未压住误报）。
+#   4. 同一批 AI 音色既说唤醒词也说不相干句子，避免模型学音色捷径。
+#
+# 路径约定：相对**训练时的工作目录** `~/theplace/XiaoZhiCam/mww_data`。
+# 历史配置写 ./data/features_* 依赖一层已消失的软链，这里直接用实际目录名。
+# 启动前先跑：
+#   python verify_training_data.py --config training_parameters_v17.yaml \
+#       --data-root ~/theplace/XiaoZhiCam/mww_data \
+#       --manifest <...>/multivoice_v1/manifest.json,<...>/features_public_v1/manifest.json
+#
+# 数据生成（全部走 libkwsfeat.so，与固件 C 链路同分布）：
+#   prepare_public_corpus.py  -> features_public_v1
+#   gen_multivoice.py         -> multivoice_v1/{positive,negative,features}
+#   prepare_positive_features.py -> features_v17_pos
+#   gen_noise_features.py     -> features_v17_noise
+#   features_v15_* / v16_mine 为历史真机误报实录，原样复用。
+
+window_step_ms: 10
+train_dir: ./trained_models/wakeword_v17
+
+features:
+  # 正样本：8 音色 × 4 条 × 4 轮增强；testing 完全来自 2 个留出音色
+  - features_dir: ./features_v17_pos
+    sampling_weight: 10.0
+    penalty_weight: 1.0
+    truth: true
+    truncation_strategy: truncate_start
+    type: mmap
+
+  # AISHELL-1 公开语料：50 说话人，按人分 train 34 / val 8 / test 8
+  - features_dir: ./features_public_v1
+    sampling_weight: 6.0
+    penalty_weight: 1.0
+    truth: false
+    truncation_strategy: random
+    type: mmap
+
+  # 与正样本同一批音色的不相干句子（含「现在几点了」类指令问句）
+  - features_dir: ./multivoice_v1/features
+    sampling_weight: 4.0
+    penalty_weight: 1.0
+    truth: false
+    truncation_strategy: random
+    type: mmap
+
+  # 真机 10 分钟房间底噪（连续流提特征后切窗）
+  - features_dir: ./features_v17_noise
+    sampling_weight: 4.0
+    penalty_weight: 1.0
+    truth: false
+    truncation_strategy: random
+    type: mmap
+
+  # 真机指令实录 / 实拍 / 定向挖掘的历史误报点
+  - features_dir: ./features_v15_cmdmon
+    sampling_weight: 4.0
+    penalty_weight: 1.0
+    truth: false
+    truncation_strategy: random
+    type: mmap
+
+  - features_dir: ./features_v15_livemon
+    sampling_weight: 2.0
+    penalty_weight: 1.0
+    truth: false
+    truncation_strategy: random
+    type: mmap
+
+  - features_dir: ./features_v16_mine
+    sampling_weight: 6.0
+    penalty_weight: 1.0
+    truth: false
+    truncation_strategy: random
+    type: mmap
+
+training_steps:
+  - 12000
+learning_rates:
+  - 0.001
+batch_size: 128
+eval_step_interval: 500
+clip_duration_ms: 1500
+spectrogram_length: 204
+spectrogram_length_final_layer: 50
+stride: 3
+negative_class_weight:
+  - 20
+positive_class_weight:
+  - 1
+target_minimization: 2.0
+minimization_metric: ambient_false_positives_per_hour
+maximization_metric: average_viable_recall
+
+flags:
+  model_name: mixednet
+  first_conv_filters: 32
+  first_conv_kernel_size: 5
+  pointwise_filters: 64,64,64,64
+  mixconv_kernel_sizes: '[5], [7,11], [9,15], [23]'
+  repeat_in_block: 1, 1, 1, 1
+  residual_connection: 0,0,0,0
+  max_pool: 0
+  spatial_attention: 0
+  pooled: 0
+  restore_checkpoint: 0
+  test_tf_nonstreaming: 0
+  test_tflite_nonstreaming: 0
+  test_tflite_nonstreaming_quantized: 0
+  test_tflite_streaming: 0
+  test_tflite_streaming_quantized: 1

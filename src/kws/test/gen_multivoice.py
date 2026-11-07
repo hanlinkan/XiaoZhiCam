@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """用多音色 TTS 生成「该醒 / 不该醒」成对素材。
 
-设计要点（docs/wakeword-retrain-guide.md）：
+设计要点（见本地训练笔记，仓库不分发）：
   * 正样本过去只有 1 个 piper 音色 + 48 条真人，模型容易学成「听见真人说话就醒」。
     这里用 edge-tts 的多个 zh-CN 音色扩充说话人多样性，成本近乎为零。
   * **同一批音色既说「你好小智」，也说一堆不相干句子**。否则正负样本的音色
@@ -167,16 +167,31 @@ async def generate(args, voices):
 
 
 def build_negative_features(args, out_root, manifest):
-    """把负句 WAV 转成固件同分布特征，按音色分组（测试集音色完全独立）。"""
+    """把负句 WAV 转成固件同分布特征，按音色分组（测试集音色完全独立）。
+
+    负句必须和正样本走**同样的房间/噪声域**：正样本经 gen_features_deploy.py
+    的 Augmentation 加了 RIR 与背景噪声，若负句是干净的 TTS，模型最省力的解法
+    会是「带噪合成短句=该醒、干净合成短句=不该醒」，真机上依旧乱醒。
+    """
     cc.setup_deploy(args.noise)
     rng = np.random.default_rng(args.seed + 1)
+    rirs = cc.load_rirs(args.rirs) if args.rir_prob > 0 else []
+    noise16k = cc.load_noise16k(args.noise) if args.snr_max > args.snr_min else None
+    print("负句增强：RIR %d 个 / 概率 %.2f / SNR %.0f~%.0f dB" %
+          (len(rirs), args.rir_prob, args.snr_min, args.snr_max))
     by_voice = {}
     for rec in manifest["files"]:
         if rec["label"] != 0:
             continue
         path = os.path.join(out_root, rec["path"])
         try:
-            feats = cc.to_features(cc.read_wav16k(path), rng)
+            audio = cc.read_wav16k(path)
+            if rirs and rng.random() < args.rir_prob:
+                audio = cc.apply_rir(audio, rirs[int(rng.integers(0, len(rirs)))][1])
+            if noise16k is not None:
+                audio = cc.add_noise(audio, noise16k,
+                                     float(rng.uniform(args.snr_min, args.snr_max)), rng)
+            feats = cc.to_features(audio, rng)
             wins = cc.cut_windows(feats)
         except Exception as e:
             print("  [warn] %s: %s" % (path, e), file=sys.stderr)
@@ -227,6 +242,10 @@ def main():
     ap.add_argument("--negative-features", action="store_true",
                     help="负句直接产出固件特征（按音色分组）")
     ap.add_argument("--noise", default=DEFAULT_MWW + "/noise30m.raw")
+    ap.add_argument("--rirs", default=DEFAULT_MWW + "/mit_rirs", help="房间脉冲响应目录")
+    ap.add_argument("--rir-prob", type=float, default=0.5, help="负句加房间混响的概率")
+    ap.add_argument("--snr-min", type=float, default=5.0, help="负句叠真机底噪 SNR 下限 dB")
+    ap.add_argument("--snr-max", type=float, default=20.0, help="负句叠真机底噪 SNR 上限 dB")
     args = ap.parse_args()
 
     voices = ([v.strip() for v in args.voices.split(",") if v.strip()]

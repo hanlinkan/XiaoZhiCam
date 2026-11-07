@@ -7,9 +7,14 @@
 
 用法：
     ~/miniconda3/envs/mww/bin/python gen_features_deploy.py \
-        --src ~/mww_data/positive --out ~/mww_data/features_deploy_tts --repeat 3
-    ... --src ~/mww_data/positive_real --out ~/mww_data/features_deploy_real --repeat 8
+        --src <wav 目录> --out <features 目录> --repeat 3
+    # 留出音色的正样本：所有文件都进 testing，供 prepare_positive_features.py 组装考卷
+    ... --src <wav 目录> --out <features 目录> --all-testing
 加 --limit N 只取前 N 个源文件（冒烟用）。
+
+底噪 / 混响 / 背景音路径默认取开发机 mww_data（历史上写死 ~/mww_data，
+那个软链已不存在，会让 df.patch() 在取预热底噪时直接报错）；
+可用 --noise / --rirs / --background 显式覆盖。
 """
 import argparse
 import os
@@ -21,16 +26,33 @@ os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import mww_deploy_features as df
 
+# conda 环境里的 editable 安装指向旧路径 ~/mww_setup/...（仓库已搬到
+# ~/theplace/XiaoZhiCam/mww_setup/...），直接 import 会 ModuleNotFoundError。
+# 优先环境变量，再自动探测常见位置；不改动环境本身。
+try:
+    import microwakeword  # noqa: F401
+except ImportError:
+    HOME_TMP = os.path.expanduser("~")
+    for _root in (os.environ.get("MICROWAKEWORD_ROOT", ""),
+                  os.path.join(HOME_TMP, "theplace/XiaoZhiCam/mww_setup/microWakeWord"),
+                  os.path.join(HOME_TMP, "mww_setup/microWakeWord")):
+        _root = os.path.expanduser(_root)
+        if _root and os.path.isdir(os.path.join(_root, "microwakeword")):
+            sys.path.insert(0, _root)
+            break
+    else:
+        raise SystemExit("找不到 microwakeword 源码，请设置 MICROWAKEWORD_ROOT")
+
 from microwakeword.audio.augmentation import Augmentation
 from microwakeword.audio.clips import Clips
 from microwakeword.audio.spectrograms import SpectrogramGeneration
 from mmap_ninja.ragged import RaggedMmap
 
 HOME = os.path.expanduser("~")
-RIRS = [os.path.join(HOME, "data/mit_rirs")]
-BG = [p for p in (os.path.join(HOME, "data/negative/extracted/dinner_party"),
-                  os.path.join(HOME, "data/my_background"))
-      if os.path.isdir(p)]
+MWW = os.path.join(HOME, "theplace/XiaoZhiCam/mww_data")
+DEFAULT_NOISE = os.path.join(MWW, "noise30m.raw")
+DEFAULT_RIRS = os.path.join(MWW, "mit_rirs")
+DEFAULT_BG = os.path.join(MWW, "my_background")
 
 
 def main():
@@ -44,8 +66,16 @@ def main():
                     help="负样本用：不做增强，原始底噪直接过部署链路")
     ap.add_argument("--split-sec", type=float, default=0.0,
                     help="把长录音切成 N 秒片段（负样本用）")
+    ap.add_argument("--noise", default=os.environ.get("KWS_NOISE_RAW", DEFAULT_NOISE),
+                    help="8 kHz int16 真机底噪（特征预热用）")
+    ap.add_argument("--rirs", default=DEFAULT_RIRS, help="房间脉冲响应目录")
+    ap.add_argument("--background", default=DEFAULT_BG, help="增强用背景音目录")
+    ap.add_argument("--all-testing", action="store_true",
+                    help="所有文件都生成到 testing（留出音色考卷用），不切 train/val")
     args = ap.parse_args()
 
+    import corpus_common as cc
+    cc.setup_deploy(args.noise)   # 显式底噪 + libkwsfeat.so，绕开失效的 ~/mww_data
     df.patch()   # ← 关键：把特征提取换成固件链路
 
     src = os.path.expanduser(args.src)
@@ -62,8 +92,10 @@ def main():
         src = tmp
     print(f"源: {src}  {len(files)} 条  repeat={args.repeat}")
 
-    rir_dirs = [r for r in RIRS
-                if os.path.isdir(r) and any(f.endswith(".wav") for f in os.listdir(r))]
+    rir_dirs = [p for p in (os.path.expanduser(x) for x in args.rirs.split(",") if x.strip())
+                if os.path.isdir(p) and any(f.endswith(".wav") for f in os.listdir(p))]
+    bg_dirs = [p for p in (os.path.expanduser(x) for x in args.background.split(",") if x.strip())
+               if os.path.isdir(p)]
     augmenter = Augmentation(
         augmentation_duration_s=3.2,
         augmentation_probabilities={
@@ -77,7 +109,7 @@ def main():
             "RIR": 0.5 if rir_dirs else 0.0,
         },
         impulse_paths=rir_dirs,
-        background_paths=BG,
+        background_paths=bg_dirs,
         background_min_snr_db=-5,
         background_max_snr_db=10,
         min_jitter_s=0.195,
@@ -95,7 +127,14 @@ def main():
         split_count=0.1,
     )
 
-    for split, rep, slide in (("training", args.repeat, 10), ("validation", 1, 10), ("testing", 1, 1)):
+    if args.all_testing:
+        jobs = (("testing", args.repeat, 1, "train"),)
+    else:
+        jobs = (("training", args.repeat, 10, "train"),
+                ("validation", 1, 10, "validation"),
+                ("testing", 1, 1, "test"))
+
+    for split, rep, slide, split_name in jobs:
         out_dir = os.path.join(out_root, split)
         os.makedirs(out_dir, exist_ok=True)
         target = os.path.join(out_dir, "wakeword_mmap")
@@ -106,7 +145,6 @@ def main():
             import shutil
             shutil.rmtree(target)
 
-        split_name = {"training": "train", "validation": "validation", "testing": "test"}[split]
         t0 = time.time()
         print(f"  生成 {split}（repeat={rep} slide={slide}）...", flush=True)
         spec = SpectrogramGeneration(clips=clips, augmenter=augmenter_use,

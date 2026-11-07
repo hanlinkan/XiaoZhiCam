@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """公开语料 / 合成语音 → 固件同分布特征的公共工具。
 
-三条硬规矩（见 docs/wakeword-retrain-guide.md）：
+三条硬规矩（见本地训练笔记，仓库不分发）：
   1. 特征一律走 libkwsfeat.so（mww_deploy_features），与相机上的
      afe → 电平归一化 → 8k→16k → mel 是同一份 C 代码。
   2. training / validation / testing 按「说话人」分组，测试集里的人训练时没出现过。

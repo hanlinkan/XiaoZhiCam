@@ -1,0 +1,8 @@
+{
+  "min_recall": 0.90,
+  "max_fp_per_hour": 0.5,
+  "min_negative_hours": 6.0,
+  "max_cpu_percent": 15.0,
+  "require_no_regression": true,
+  "_comment": "量化门槛。min_negative_hours=6 来自三倍法则：0 次误报时 95% 置信上界约 3/T，要宣称 <0.5 次/h 需约 6 小时无 FP 负样本。CPU 上限沿用真机实测的 11~13% 单核并留 2% 余量。"
+}

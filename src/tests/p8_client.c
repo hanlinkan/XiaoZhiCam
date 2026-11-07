@@ -43,7 +43,6 @@
 #include "hi_comm_aio.h"
 #include "mpi_sys.h"
 #include "mpi_ai.h"
-#include "mpi_vb.h"
 #include "acodec.h"
 
 #include "afe.h"
@@ -482,42 +481,6 @@ static int audio_open(void)
 {
     HI_S32 ret;
     AIO_ATTR_S attr;
-    /* 16k 独立模式的开关：卡上存在 .solo16k 时启用。
-       此时 init_norm.sh 已用原厂 rmm 完成 MPP 内核侧初始化，再 kill -9
-       （SIGKILL 不走 SYS_Exit，内核状态保留），并把看门狗 LOAD 顶到 60s。 */
-    int solo = (access("/tmp/hd1/hack/.solo16k", F_OK) == 0);
-
-    if (solo) {
-        int i;
-        ret = HI_MPI_SYS_Init();
-        logf_("[solo16k] SYS_Init=0x%08X", (unsigned)ret);
-        ret = HI_MPI_VB_Init();
-        logf_("[solo16k] VB_Init=0x%08X", (unsigned)ret);
-        /* 不要调 AI_Disable / DisableChn：rmm 被 SIGKILL 后设备引用计数留在内核里，
-           AI_Disable 会返回 NOT_PERM 并把状态卡成"半关闭"，反而让 SetPubAttr 也失败。
-           p28b 成功的版本没有这两行，照它来。
-           实测唯一能过的组合：沿用 rmm 的 ch=2/pt=320/clk=1/frm=30，
-           只把采样率改成 16000。ch=1 或 clk=0 会返回 ILLEGAL_PARAM。 */
-        memset(&attr, 0, sizeof(attr));
-        attr.enSamplerate   = AUDIO_SAMPLE_RATE_16000;
-        attr.enBitwidth     = AUDIO_BIT_WIDTH_16;
-        attr.enWorkmode     = AIO_MODE_I2S_MASTER;
-        attr.enSoundmode    = AUDIO_SOUND_MODE_MONO;
-        attr.u32EXFlag      = 0;
-        attr.u32FrmNum      = 30;
-        attr.u32PtNumPerFrm = 320;
-        attr.u32ChnCnt      = 2;
-        attr.u32ClkSel      = 1;
-        ret = HI_MPI_AI_SetPubAttr(AI_DEV, &attr);
-        logf_("[solo16k] SetPubAttr(16000)=0x%08X", (unsigned)ret);
-        /* 池必须映射到本进程，否则 GetFrame 报 "Pool N hasn't mapped!"。
-           Pool 3 是音频池（1280B x 120），6/7 不存在会返回错误，忽略即可。 */
-        for (i = 0; i < 6; i++) {
-            ret = HI_MPI_VB_MmapPool((VB_POOL)i);
-            logf_("[solo16k] MmapPool(%d)=0x%08X", i, (unsigned)ret);
-        }
-    }
-
     /* rmm 已把参数配好（8k/mono/320点/30帧），这里只读取确认，
        绝不 SetPubAttr —— 会被拒绝且可能污染驱动状态 */
     memset(&attr, 0, sizeof(attr));
@@ -552,15 +515,11 @@ static int audio_open(void)
        AO 的 Enable/SetPubAttr/SendFrame 一律不用 —— 那是无声死路且会
        破坏 rmm 的通道状态（第 4/7 章结论）。 */
 
-    if (solo) {
-        logf_("[OK] audio ready (solo16k 16000Hz capture; playback unavailable)");
-    } else {
-        logf_("[OK] audio devices ready (capture only, playback via rmm)");
+    logf_("[OK] audio devices ready (capture only, playback via rmm)");
 
-        /* 播放无断音的前提：rmm 的发包线程不被任何实时线程饿死。
-           把它提到 FIFO 10（高于本进程全部线程），幂等。 */
-        boost_rmm_adec();
-    }
+    /* 播放无断音的前提：rmm 的发包线程不被任何实时线程饿死。
+       把它提到 FIFO 10（高于本进程全部线程），幂等。 */
+    boost_rmm_adec();
     return 0;
 }
 

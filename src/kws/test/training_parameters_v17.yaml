@@ -12,6 +12,11 @@
 #
 # 路径约定：相对**训练时的工作目录** `~/theplace/XiaoZhiCam/mww_data`。
 # 历史配置写 ./data/features_* 依赖一层已消失的软链，这里直接用实际目录名。
+#
+# ⚠️ 开训前必须在 features_public_v2/ 下备好 validation_ambient/ 与
+# testing_ambient/（把 validation/testing 的 wakeword_mmap 硬链接过去即可）。
+# 选模指标是 ambient_false_positives_per_hour，缺了这两个目录它恒为 0，
+# 训练就只会挑「召回最高」而完全不顾误报 —— 正好和本轮要修的问题相反。
 # 启动前先跑：
 #   python verify_training_data.py --config training_parameters_v17.yaml \
 #       --data-root ~/theplace/XiaoZhiCam/mww_data \

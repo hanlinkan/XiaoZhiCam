@@ -6,7 +6,7 @@
 #      大部分素材（verify_training_data.py 体检：正样本 training = 0）。
 #   2. 正样本改为 8 个 edge-tts 中文音色（其中 2 个留出只进 testing），
 #      不再依赖单一 piper 音色 + 48 条真人录音。
-#   3. 负样本新增 AISHELL-1 多说话人语料（50 人 × 60 条，按人分组），
+#   3. 负样本新增 AISHELL-1 多说话人语料（160 人 × 120 条，按人分组），
 #      并按用户结论去掉 162 条近音词硬负样本（历史上未压住误报）。
 #   4. 同一批 AI 音色既说唤醒词也说不相干句子，避免模型学音色捷径。
 #
@@ -15,10 +15,10 @@
 # 启动前先跑：
 #   python verify_training_data.py --config training_parameters_v17.yaml \
 #       --data-root ~/theplace/XiaoZhiCam/mww_data \
-#       --manifest <...>/multivoice_v1/manifest.json,<...>/features_public_v1/manifest.json
+#       --manifest <...>/multivoice_v1/manifest.json,<...>/features_public_v2/manifest.json
 #
 # 数据生成（全部走 libkwsfeat.so，与固件 C 链路同分布）：
-#   prepare_public_corpus.py  -> features_public_v1
+#   prepare_public_corpus.py  -> features_public_v2
 #   gen_multivoice.py         -> multivoice_v1/{positive,negative,features}
 #   prepare_positive_features.py -> features_v17_pos
 #   gen_noise_features.py     -> features_v17_noise
@@ -36,8 +36,10 @@ features:
     truncation_strategy: truncate_start
     type: mmap
 
-  # AISHELL-1 公开语料：50 说话人，按人分 train 34 / val 8 / test 8
-  - features_dir: ./features_public_v1
+  # AISHELL-1 公开语料：160 说话人 × 120 条，按人分 104/16/40
+  # （val_ratio 0.10 / test_ratio 0.25），testing = 6.06 h 独立音频，过 6 h 门槛
+  # 带 0.3 概率房间混响 + 5~20 dB 真机底噪，与多音色负句同域
+  - features_dir: ./features_public_v2
     sampling_weight: 6.0
     penalty_weight: 1.0
     truth: false

@@ -30,8 +30,20 @@ from mmap_ninja.ragged import RaggedMmap
 HERE = os.path.dirname(os.path.abspath(__file__))
 
 
-def score_window(interp, inp, out, win, max_frames, scale, zero_point):
-    """把一条 (T,40) float32 特征按流式方式逐 3 帧喂进去，返回最高概率。"""
+def make_interp(model_path):
+    interp = Interpreter(model_path=model_path,
+                         experimental_op_resolver_type=OpResolverType.BUILTIN_REF)
+    interp.allocate_tensors()
+    return interp, interp.get_input_details()[0], interp.get_output_details()[0]
+
+
+def score_window(factory, win, max_frames, scale, zero_point):
+    """把一条 (T,40) float32 特征按流式方式逐 3 帧喂进去，返回最高概率。
+
+    每条窗口都用**全新的 Interpreter**：实测 `reset_all_variables()` 不能把这个
+    流式模型的内部状态清干净，前面跑过正样本后，同一批底噪的分数会从
+    max=83/0 命中漂到 max=255/1 命中。尺子不能依赖样本顺序。
+    """
     x = np.asarray(win, dtype=np.float32)[-max_frames:]
     if x.ndim != 2 or x.shape[1] != 40:
         raise ValueError("特征形状应为 (T,40)，实际 %s" % (x.shape,))
@@ -39,10 +51,7 @@ def score_window(interp, inp, out, win, max_frames, scale, zero_point):
         q = np.clip(np.round(x / scale + zero_point), -128, 127).astype(np.int8)
     else:
         q = x.astype(np.int8)
-    try:
-        interp.reset_all_variables()
-    except Exception:
-        pass
+    interp, inp, out = factory()
     peak = 0
     for i in range(0, len(q) - 2, 3):
         chunk = q[i:i + 3]
@@ -55,7 +64,7 @@ def score_window(interp, inp, out, win, max_frames, scale, zero_point):
     return peak
 
 
-def run_dir(interp, inp, out, path, split, limit, args, scale, zp):
+def run_dir(factory, path, split, limit, args, scale, zp):
     target = os.path.join(path, split, "wakeword_mmap")
     if not os.path.isdir(target):
         return {"dir": path, "error": "缺少 %s" % target}
@@ -63,13 +72,21 @@ def run_dir(interp, inp, out, path, split, limit, args, scale, zp):
         mm = RaggedMmap(target)
     except Exception as e:
         return {"dir": path, "error": str(e)}
-    n = min(len(mm), limit) if limit else len(mm)
+    total = len(mm)
+    n = min(total, limit) if limit else total
+    # 窗口按说话人顺序写入，取「前 N 条」会集中在极少数人身上，
+    # 误报率会随分组顺序剧烈漂移。默认跨整个 split 随机抽样。
+    if args.sample == "random" and n < total:
+        rng = np.random.default_rng(args.seed)
+        idx = np.sort(rng.choice(total, size=n, replace=False))
+    else:
+        idx = list(range(n))
     peaks = []
-    for i in range(n):
+    for i in idx:
         try:
-            peaks.append(score_window(interp, inp, out, mm[i], args.max_frames, scale, zp))
+            peaks.append(score_window(factory, mm[i], args.max_frames, scale, zp))
         except Exception as e:
-            return {"dir": path, "error": "第 %d 条推理失败: %s" % (i, e)}
+            return {"dir": path, "error": "第 %d 条推理失败: %s" % (int(i), e)}
     arr = np.asarray(peaks, dtype=np.float64)
     return {
         "dir": os.path.abspath(path),
@@ -91,6 +108,9 @@ def main():
     ap.add_argument("--negative", action="append", default=[], help="负样本特征根目录，可重复")
     ap.add_argument("--split", default="testing")
     ap.add_argument("--limit", type=int, default=40, help="每个目录最多评多少窗口，0=全部")
+    ap.add_argument("--sample", choices=["random", "first"], default="random",
+                    help="抽样方式；random 跨说话人随机，first 取前 N 条（调试用）")
+    ap.add_argument("--seed", type=int, default=1234, help="随机抽样种子")
     ap.add_argument("--threshold", type=int, default=240, help="命中门限（与固件一致）")
     ap.add_argument("--max-frames", type=int, default=204,
                     help="取窗口末尾多少帧（对应训练配置 spectrogram_length）")
@@ -99,21 +119,24 @@ def main():
     if not args.positive and not args.negative:
         ap.error("至少要给一个 --positive 或 --negative")
 
-    interp = Interpreter(model_path=os.path.expanduser(args.model),
-                         experimental_op_resolver_type=OpResolverType.BUILTIN_REF)
-    interp.allocate_tensors()
-    inp = interp.get_input_details()[0]
-    out = interp.get_output_details()[0]
+    model_path = os.path.expanduser(args.model)
+
+    def factory():
+        return make_interp(model_path)
+
+    _, inp, _ = factory()
     scale, zp = inp.get("quantization", (0.0, 0))
     print("模型输入 %s %s %s  量化 scale=%s zp=%s" %
           (inp["name"], inp["shape"], inp["dtype"], scale, zp))
 
     report = {"model": os.path.abspath(os.path.expanduser(args.model)),
               "split": args.split, "threshold": args.threshold,
-              "max_frames": args.max_frames, "positive": [], "negative": []}
+              "max_frames": args.max_frames, "sample": args.sample,
+              "seed": args.seed, "limit": args.limit,
+              "positive": [], "negative": []}
     for label, dirs in (("positive", args.positive), ("negative", args.negative)):
         for d in dirs:
-            r = run_dir(interp, inp, out, os.path.expanduser(d), args.split,
+            r = run_dir(factory, os.path.expanduser(d), args.split,
                         args.limit, args, scale, zp)
             report[label].append(r)
             if "error" in r:

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """把 AISHELL-1 之类的公开多说话人语料变成「固件同分布」的负样本特征。
 
-为什么要有这个脚本（docs/wakeword-retrain-guide.md）：
+为什么要有这个脚本（见本地训练笔记，仓库不分发）：
   真机误报是「听见真人说不相干的话就醒」，而训练负样本过去主要靠单一 TTS 音色。
   AISHELL-1 约 165 h / 400 说话人，正好补上说话人多样性；但它不能直接喂训练——
   公开录音是干净的 16 kHz，相机链路吃 8 kHz 且带 afe / 电平归一化 / 真机底噪。
@@ -101,8 +101,12 @@ def main():
     ap.add_argument("--snr-min", type=float, default=None, help="叠底噪 SNR 下限 dB")
     ap.add_argument("--snr-max", type=float, default=None, help="叠底噪 SNR 上限 dB")
     ap.add_argument("--hop", type=int, default=cc.HOP_FRAMES, help="窗口跳步（帧）")
+    ap.add_argument("--val-ratio", type=float, default=0.15, help="按说话人划给 validation 的比例")
+    ap.add_argument("--test-ratio", type=float, default=0.15, help="按说话人划给 testing 的比例")
     ap.add_argument("--resume", action="store_true", help="跳过已有 cache/<spk>.pkl")
     ap.add_argument("--overwrite", action="store_true", help="清掉已有 cache 重跑")
+    ap.add_argument("--regroup-only", action="store_true",
+                    help="只从 cache 重新划分并重写 split/manifest，不重新提特征（调比例用）")
     args = ap.parse_args()
 
     if not (0.0 <= args.rir_prob <= 1.0):
@@ -111,6 +115,10 @@ def main():
         ap.error("--snr-min / --snr-max 必须同时给出")
     if args.snr_min is not None and args.snr_min > args.snr_max:
         ap.error("--snr-min 不能大于 --snr-max")
+    if not (0.0 <= args.val_ratio < 1.0 and 0.0 <= args.test_ratio < 1.0):
+        ap.error("--val-ratio / --test-ratio 必须在 0~1")
+    if args.val_ratio + args.test_ratio >= 0.9:
+        ap.error("--val-ratio + --test-ratio 太大会让 training 为空")
 
     out_root = os.path.expanduser(args.out)
     cache_dir = os.path.join(out_root, "cache")
@@ -139,55 +147,76 @@ def main():
           (args.noise, len(rirs), args.rir_prob,
            "off" if args.snr_min is None else "%g~%g dB" % (args.snr_min, args.snr_max)))
 
-    by_spk = {}
+    by_spk_wins = {}
+    by_spk_sec = {}
     t_all = time.time()
-    for spk, name, wav_bytes in iter_speaker_wavs(args.aishell, args.speakers,
-                                                   args.per_speaker, slist):
-        cache_file = os.path.join(cache_dir, spk + ".pkl")
-        if args.resume and os.path.isfile(cache_file):
-            with open(cache_file, "rb") as cf:
-                by_spk.setdefault(spk, []).extend(pickle.load(cf))
-            continue
-        try:
-            audio = cc.read_wav16k(io.BytesIO(wav_bytes))
-            if len(audio) < 1600:
+
+    def load_cache(spk, path):
+        with open(path, "rb") as cf:
+            rec = pickle.load(cf)
+        # 兼容早期只存窗口列表的 cache
+        wins, sec = (rec["windows"], rec.get("seconds", 0.0)) \
+            if isinstance(rec, dict) else (rec, 0.0)
+        by_spk_wins.setdefault(spk, []).extend(wins)
+        by_spk_sec[spk] = by_spk_sec.get(spk, 0.0) + sec
+
+    if args.regroup_only:
+        for fn in sorted(f for f in os.listdir(cache_dir) if f.endswith(".pkl")):
+            load_cache(fn[:-4], os.path.join(cache_dir, fn))
+        print("regroup: 从 cache 载入 %d 个说话人，不重新提特征" % len(by_spk_wins))
+    else:
+        for spk, name, wav_bytes in iter_speaker_wavs(args.aishell, args.speakers,
+                                                       args.per_speaker, slist):
+            cache_file = os.path.join(cache_dir, spk + ".pkl")
+            if args.resume and os.path.isfile(cache_file):
+                load_cache(spk, cache_file)
                 continue
-            if rirs and rng.random() < args.rir_prob:
-                idx = int(rng.integers(0, len(rirs)))
-                audio = cc.apply_rir(audio, rirs[idx][1])
-            if noise16k is not None:
-                snr = float(rng.uniform(args.snr_min, args.snr_max))
-                audio = cc.add_noise(audio, noise16k, snr, rng)
-            feats = cc.to_features(audio, rng)
-            wins = cc.cut_windows(feats, hop=args.hop)
-        except Exception as e:
-            print("  [warn] %s/%s 处理失败: %s" % (spk, name, e), file=sys.stderr)
-            continue
-        if not wins:
-            continue
-        by_spk.setdefault(spk, []).extend(wins)
-        print("  %s %-32s -> %d 窗口" % (spk, name, len(wins)))
+            try:
+                audio = cc.read_wav16k(io.BytesIO(wav_bytes))
+                if len(audio) < 1600:
+                    continue
+                seconds = len(audio) / 16000.0
+                if rirs and rng.random() < args.rir_prob:
+                    idx = int(rng.integers(0, len(rirs)))
+                    audio = cc.apply_rir(audio, rirs[idx][1])
+                if noise16k is not None:
+                    snr = float(rng.uniform(args.snr_min, args.snr_max))
+                    audio = cc.add_noise(audio, noise16k, snr, rng)
+                feats = cc.to_features(audio, rng)
+                wins = cc.cut_windows(feats, hop=args.hop)
+            except Exception as e:
+                print("  [warn] %s/%s 处理失败: %s" % (spk, name, e), file=sys.stderr)
+                continue
+            if not wins:
+                continue
+            by_spk_wins.setdefault(spk, []).extend(wins)
+            by_spk_sec[spk] = by_spk_sec.get(spk, 0.0) + seconds
+            print("  %s %-32s -> %d 窗口 (%.1f s)" % (spk, name, len(wins), seconds))
 
     # 窗口长度可变（尾部不足 309 帧但 >=150 帧的仍然有效），
     # 所以按说话人存成 list 的 pickle，不能用 np.stack / concatenate。
     per_speaker_windows = {}
-    for spk, wins in by_spk.items():
+    for spk, wins in by_spk_wins.items():
         if not wins:
             continue
-        with open(os.path.join(cache_dir, spk + ".pkl"), "wb") as cf:
-            pickle.dump(wins, cf)
+        if not args.regroup_only:
+            with open(os.path.join(cache_dir, spk + ".pkl"), "wb") as cf:
+                pickle.dump({"windows": wins, "seconds": by_spk_sec.get(spk, 0.0)}, cf)
         per_speaker_windows[spk] = wins
 
     speakers = sorted(per_speaker_windows)
     if len(speakers) < 3:
         raise SystemExit("只拿到 %d 个说话人，至少要 3 个才能分 train/val/test" % len(speakers))
-    groups = cc.speaker_groups(speakers, args.seed)
+    groups = cc.speaker_groups(speakers, args.seed, args.val_ratio, args.test_ratio)
 
     counts = {}
+    split_seconds = {}
     for split, names in groups.items():
         ws = [w for s in names for w in per_speaker_windows.get(s, [])]
         counts[split] = cc.write_split(out_root, split, ws) if ws else 0
-        print("%-10s: %d 说话人 / %d 窗口" % (split, len(names), counts[split]))
+        split_seconds[split] = round(sum(by_spk_sec.get(s, 0.0) for s in names), 1)
+        print("%-10s: %d 说话人 / %d 窗口 / %.2f h 独立音频" %
+              (split, len(names), counts[split], split_seconds[split] / 3600.0))
 
     cc.write_manifest(os.path.join(out_root, "manifest.json"), {
         "source": os.path.abspath(os.path.expanduser(args.aishell)),
@@ -203,8 +232,13 @@ def main():
         "window_frames": cc.WIN_FRAMES,
         "hop_frames": args.hop,
         "feat_dim": cc.FEAT_DIM,
+        "val_ratio": args.val_ratio,
+        "test_ratio": args.test_ratio,
+        "regroup_only": args.regroup_only,
         "split_speakers": groups,
         "split_windows": counts,
+        "split_seconds": split_seconds,
+        "total_source_seconds": round(sum(by_spk_sec.values()), 1),
         "elapsed_s": round(time.time() - t_all, 1),
         "note": "负样本；特征由 libkwsfeat.so 生成，与固件连续流同分布",
     })

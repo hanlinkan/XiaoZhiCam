@@ -20,7 +20,12 @@
 - 小蚁 720P 一代夜视版（YHS-113 / YHS-113-IR，型号 22CN）
 - 原厂固件 `1.8.7.0C`（telnet 登录后 `cat /home/version` 可查）
 - 相机**已经用米家 App 配好 WiFi** —— 语音助手要联网，没网就没反应
-- 一张 FAT32 的 SD 卡（卡里的录像不影响，不用清空）
+- 一张 FAT32 的 SD 卡（卡里的录像不影响，不用清空）。**卡必须有 MBR 分区表、
+  第一个分区是 FAT32** —— 原厂 `init.sh` 挂的是 `/dev/hd1`，整盘直格式化（无分区表）
+  的卡不会生成这个设备节点，钩子永远不触发。Windows 格式化、SD Card Formatter
+  出来的都是这种结构；Linux 下别直接 `mkfs.vfat /dev/sdX`。
+
+
 
 **2. 拷贝**
 
@@ -109,6 +114,44 @@ flash 上只留两处很小的痕迹（首次启动时写入，之后不再碰�
 - 同目录下 `forbidden.g726.orig`，原厂提示音备份（9 KB）
 
 播放对话时**不写 flash**：段文件都在内存盘上，只改内存盘里的符号链接。
+
+### 为什么别人的相机插卡就能用
+
+原厂 `/home/init.sh` 第 37 行有个出厂测试钩子：
+
+```sh
+if [ -f "/home/hd1/test/equip_test.sh" ]; then
+        /home/hd1/test/equip_test.sh
+        exit
+fi
+```
+
+它排在 `cd /home; ./rmm &` **之前**，而且 `exit` 掉了整个脚本。所以插着这张卡开机时，
+原厂流程根本走不到启动 `rmm` 那一步，flash 上的原版 `rmm` 完全不参与 —— 这就是
+「别人的相机一个字节都不用改 flash」的原因。只有被手工改过（比如把 `/home/rmm`
+换成指向 SD 的符号链接）的机器，才需要先把原版写回去。
+
+**彻底还原一台被改过的机器**（原版二进制在卡上 `hack/bin/rmm_orig`）：
+
+```sh
+cp /tmp/hd1/hack/bin/rmm_orig /home/rmm.new && sync
+chmod 755 /home/rmm.new && rm /home/rmm && mv /home/rmm.new /home/rmm && sync
+md5sum /home/rmm          # 期望 ebc2650d4f06d04a070730a8bce0dbc9
+rm /home/forbidden.g726 && mv /home/forbidden.g726.orig /home/forbidden.g726
+```
+
+### 卡模式为什么关掉 `watch_process`
+
+原厂 `/home/wp_cmd` 挂着 `p2pserver` / `goolink` / `mp4record` / `cloud` /
+`record_event` / `p2p_tnp` 六项「缺了就拉起」的规则，`watch_process` 每 10 秒扫一次。
+这台相机总内存只有 34 MB、运行期空闲 1–2 MB，`cloud` 一项就要 ~0.9 MB —— 被拉起来
+语音必崩。
+
+所以 `init_norm.sh` **不启动 `watch_process`**，改由 `autostart.sh` 里的 guard 循环
+接管它真正有价值的两件事：`rmm` 掉了就重启整机、持续清掉云/P2P/录像进程。
+对「已经手工精简过 `wp_cmd` 的机器」看不出区别，但**对没改过的相机是必需的**。
+
+同理，`rmm` 启动时卡上文件若缺失/损坏，会退回 flash 上的原版 `rmm`，不会陷入重启循环。
 
 ---
 

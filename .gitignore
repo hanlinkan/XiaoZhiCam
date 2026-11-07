@@ -48,6 +48,9 @@ __pycache__/
 venv/
 *.egg-info/
 
+video/
+.workbuddy/
+
 # ---- 编辑器 / 系统 ----
 .vscode/
 .idea/

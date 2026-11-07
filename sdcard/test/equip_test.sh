@@ -1,6 +1,6 @@
 #!/bin/sh
 # ============================================================================
-#  XiaoZhiCam —— SD 卡引导钩子 v5
+#  XiaoZhiCam —— SD 卡引导钩子 v6
 # ============================================================================
 #  原理：原厂 /home/init.sh 里有个出厂测试钩子——
 #
@@ -31,7 +31,7 @@ mkdir -p $L $W 2>/dev/null
 LOG=$W/boot.log
 
 {
-  echo "==================== equip_test.sh v5 ===================="
+  echo "==================== equip_test.sh v6 ===================="
   echo "date      = $(date)"
   echo "argv0     = $0"
   echo "cwd       = $(pwd)"
@@ -75,12 +75,18 @@ LOG=$W/boot.log
         sed -i 's|^[[:space:]]*\./record_event &|# ./record_event \&|' $W/init_norm.sh 2>/dev/null
         sed -i 's|^[[:space:]]*\./mp4record 60 &|# ./mp4record 60 \&|' $W/init_norm.sh 2>/dev/null
         sed -i 's|^[[:space:]]*\./cloud &|# ./cloud \&|' $W/init_norm.sh 2>/dev/null
-        # rmm 换成 SD 上的 patch 版（原厂有 19 段播放上限，长回答会卡顿），
-        # 并去掉「把 /home/rmm 改成符号链接」的兜底 —— 那样拔卡就断链了
+        # v6：watch_process 必须停。原厂 /home/wp_cmd 挂着 6 项云/P2P 服务，
+        # watch_process 每 10s 会把它们拉回来，34MB 内存直接吃光（cloud 一项 0.9MB）。
+        # 我们自己精简过 wp_cmd 的样机看不出问题，没改过的相机会直接崩，所以一律停；
+        # 原厂 wp_cmd 里的 rmm 守护由 autostart.sh 的 guard 循环接管。
+        sed -i 's|^[[:space:]]*/home/watch_process &|# watch_process 已停用（卡模式）|' $W/init_norm.sh 2>/dev/null
+        # v6：rmm 换成 SD 上的 patch 版（原厂有 19 段播放上限，长回答会卡顿）；
+        # 卡上文件缺失时退回 flash 上的原厂 rmm，绝不 reboot 循环。
+        # 同时去掉「把 /home/rmm 改成符号链接」的兜底 —— 那样拔卡就断链了。
         if [ -f $L/bin/rmm ]; then
-          sed -i 's|^[[:space:]]*\./rmm &|/tmp/hd1/hack/bin/rmm \&|' $W/init_norm.sh 2>/dev/null
+          sed -i 's|^[[:space:]]*\./rmm &|if [ -x /tmp/hd1/hack/bin/rmm ]; then /tmp/hd1/hack/bin/rmm \& else ./rmm \& fi|' $W/init_norm.sh 2>/dev/null
           sed -i '/ln -sf .*rmm_orig .*\/home\/rmm/d' $W/init_norm.sh 2>/dev/null
-          echo "  rmm 已指向 SD 上的 patch 版"
+          echo "  rmm 已指向 SD 上的 patch 版（缺失时回退原厂 rmm）"
         fi
         echo "  已停用 录像/云服务（现场补丁）"
       elif [ -s $L/init_norm.sh ]; then

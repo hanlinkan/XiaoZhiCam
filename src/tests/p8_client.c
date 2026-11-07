@@ -41,7 +41,9 @@
 #include "hi_type.h"
 #include "hi_common.h"
 #include "hi_comm_aio.h"
+#include "hi_comm_adec.h"
 #include "mpi_sys.h"
+#include "mpi_adec.h"
 #include "mpi_ai.h"
 #include "acodec.h"
 
@@ -477,6 +479,8 @@ static int acodec_open(void)
 }
 
 static void boost_rmm_adec(void);
+static int  pb_adec_init(void);
+static int  pb_trigger_via_rmm(void);
 static int audio_open(void)
 {
     HI_S32 ret;
@@ -514,6 +518,39 @@ static int audio_open(void)
     /* AO 不碰：播放走 rmm 的 beep 通路（逆向记录第 9 章），
        AO 的 Enable/SetPubAttr/SendFrame 一律不用 —— 那是无声死路且会
        破坏 rmm 的通道状态（第 4/7 章结论）。 */
+
+    /* CPLD 音频通路总开关（cpld_periph 的第一对 GPIO）。
+     *
+     * 逆向 rmm main(0x39e2c)：CLI 放音模式会在放音后 ioctl(0x7021) 把它关掉；
+     * 而 daemon 模式启动时也会先 ioctl(0x7021) 回到待机。
+     *
+     * 实测（2026-11-07）：0x7021 关掉的不只是喇叭功放，**麦克风偏置供电也一起没了**
+     * —— KWS 立刻变聋（日志里只剩 saturating 的开机误触发，之后 0 hit），
+     * 而且 CPLD 状态能扛过软重启，reboot 也救不回来，只有 0x7020 能恢复。
+     *
+     * 所以这里在启动时无条件拉高一次，保证麦克风与喇叭都上电。
+     * 约定：本程序此后**绝不再调 0x7021**，宁可让功放常开。 */
+    {
+        int cfd = open("/dev/cpld_periph", O_RDWR);
+        if (cfd >= 0) {
+            int r = ioctl(cfd, 0x7020, 0);
+            logf_("[cpld] audio power on (0x7020) ret=%d", r);
+            close(cfd);
+        } else {
+            logf_("[warn] open /dev/cpld_periph failed errno=%d", errno);
+        }
+    }
+
+    /* 自己接管播放的初始化默认关闭。
+     *
+     * 原因（2026-11-07 实测）：ADEC_CreateChn / SYS_Bind 都要求先调
+     * HI_MPI_SYS_Init()，而在本进程里调 SYS_Init 会打乱 rmm 已经建好的
+     * MPP/AI 状态 —— 麦克风电平不变但 KWS 再不出命中，等于把语音弄哑。
+     *
+     * 所以默认走原来的 rmm 播放（功能完好）；直连播放的完整配方与代码保留在
+     * pb_adec_init / pb_direct_thread / pb_trigger 里，等找到不破坏 AI 的
+     * 初始化方式（例如 fork 出独立进程去做 ADEC）再启用。 */
+    if (getenv("PB_DIRECT")) pb_adec_init();
 
     logf_("[OK] audio devices ready (capture only, playback via rmm)");
 
@@ -825,8 +862,41 @@ static int adec_sendcnt(void)
     return v;
 }
 
-/* 向 rmm 发 0x1614（forbidden 提示音 = 我们的 TTS 段） */
-static int pb_trigger(void)
+/* ================= 自己接管播放（不再经 rmm） =================
+ *
+ * 逆向 rmm 得到的完整配方（send_ao_beep @0x2ca1c + main @0x39e2c，2026-11-07 实测）：
+ *
+ *   open("/dev/cpld_periph"); ioctl(0x7020, 0)      // 音频电源（含麦克风偏置）
+ *   ADEC_CreateChn(0, {PT_G726, u32BufSize=20, ADEC_MODE_PACK, {enG726bps=4}})
+ *   SYS_Bind(ADEC0 -> AO0)                          // 解码结果直送 AO
+ *   每包: 4 字节头 {0,1,0x28,0} + 80 字节 G.726, u32Len=84, 间隔 23ms
+ *
+ * 头部 byte[2]=0x28 是关键：DecodeG726Frm 用 total=(byte[2]+2)*2=84 当消费长度，
+ * 送裸 G.726 会被算错长度，返回 0xA0188040（那是"解码回调返回非零"的通用包装码）。
+ *
+ * 为什么用线程：保持和以前 mq_send 一样"立即返回"的语义。主循环靠
+ * /proc/umap/adec 的 SendCnt 追平 expected 来判断播放完成 —— 我们自己发的包
+ * 每包让 SendCnt +1，所以那套进度逻辑原样成立（以前 rmm 发时它恒为 0，
+ * 每次播放都要等 10 秒超时才放行）。
+ */
+
+#ifndef PB_LINK
+#define PB_LINK "/home/forbidden.g726"
+#endif
+
+#define PB_DIRECT_PKT    80                 /* 每包 G.726 载荷字节数，与 rmm 一致 */
+#define PB_DIRECT_MAX    (512 * 1024)
+
+static int              g_adec_ok;          /* ADEC 通道与绑定是否就绪 */
+static volatile int     g_pb_direct_busy;   /* 上一段是否还在播 */
+
+struct pb_job {
+    unsigned char *data;
+    int            len;
+};
+
+/* 回退路径：原来的 mq 0x1614，让 rmm 播 PB_LINK。ADEC 初始化失败时用。 */
+static int pb_trigger_via_rmm(void)
 {
     unsigned char msg[16];
     mqd_t mq;
@@ -838,13 +908,149 @@ static int pb_trigger(void)
         return -1;
     }
     memset(msg, 0, sizeof(msg));
-    msg[8] = 0x14; msg[9] = 0x16;               /* u16 0x1614 小端 */
+    msg[8] = 0x14; msg[9] = 0x16;
     ret = mq_send(mq, (char *)msg, sizeof(msg), 0);
     mq_close(mq);
     if (ret != 0) {
         logf_("[pb] mq_send failed errno=%d", errno);
         return -1;
     }
+    return 0;
+}
+
+static int pb_adec_init(void)
+{
+    HI_S32           ret;
+    ADEC_CHN_ATTR_S  attr;
+    ADEC_ATTR_G726_S g726;
+    MPP_CHN_S        src, dst;
+
+    /* ADEC_CreateChn / SYS_Bind 都要求本进程先 SYS_Init（否则 0xA0188003 /
+       0xA0028003 ILLEGAL_PARAM）。本程序原本依赖 rmm 拉起的 MPP、从不初始化，
+       这里补上。放在采集线程启动之前调用，避免影响正在跑的 AI 取帧。 */
+    ret = HI_MPI_SYS_Init();
+    logf_("[pb] SYS_Init=0x%08X", (unsigned)ret);
+
+    memset(&g726, 0, sizeof(g726));
+    g726.enG726bps = (G726_BPS_E)4;          /* 与 rmm 的 pValue={4} 一致 */
+
+    memset(&attr, 0, sizeof(attr));
+    attr.enType     = PT_G726;
+    attr.u32BufSize = 20;                    /* rmm 的值；2048 会 ILLEGAL_PARAM */
+    attr.enMode     = ADEC_MODE_PACK;
+    attr.pValue     = &g726;
+
+    /* 本进程不调 HI_MPI_SYS_Init()（一直依赖 rmm 把 MPP 拉起来），
+       因此 CreateChn 会返回 0xA0188003 ILLEGAL_PARAM。但这不要紧：
+       rmm 启动时已经在内核里建好了 chn0（g726 / buf20 / PACK / bps4），
+       我们要的就是复用同一条通道 —— 直接跳过，接着做 Bind 即可。 */
+    ret = HI_MPI_ADEC_CreateChn(0, &attr);
+    if (ret != 0 && ret != 0xA0188004u)
+        logf_("[pb] ADEC_CreateChn=0x%08X（复用 rmm 已建的 chn0）", (unsigned)ret);
+
+    memset(&src, 0, sizeof(src));
+    memset(&dst, 0, sizeof(dst));
+    src.enModId = HI_ID_ADEC; src.s32DevId = 0; src.s32ChnId = 0;
+    dst.enModId = HI_ID_AO;   dst.s32DevId = 0; dst.s32ChnId = 0;
+    ret = HI_MPI_SYS_Bind(&src, &dst);
+    if (ret != 0) {
+        logf_("[pb] SYS_Bind(ADEC->AO)=0x%08X（回退 rmm 播放）", (unsigned)ret);
+        return -1;
+    }
+
+    g_adec_ok = 1;
+    logf_("[pb] direct ADEC ready（自己接管播放，不经 rmm）");
+    return 0;
+}
+
+/* 发包线程：按 rmm 的节奏 23ms 一包，靠 ADEC 队列反压自动适配真实码率 */
+static void *pb_direct_thread(void *arg)
+{
+    struct pb_job  *j = (struct pb_job *)arg;
+    unsigned char   pkt[PB_DIRECT_PKT + 4];
+    AUDIO_STREAM_S  st;
+    int             off = 0, seq = 0, sent = 0, fail = 0;
+
+    while (off + PB_DIRECT_PKT <= j->len) {
+        pkt[0] = 0; pkt[1] = 1; pkt[2] = 0x28; pkt[3] = 0;
+        memcpy(pkt + 4, j->data + off, PB_DIRECT_PKT);
+
+        memset(&st, 0, sizeof(st));
+        st.pStream = pkt;
+        st.u32Len  = PB_DIRECT_PKT + 4;      /* 84，含 4 字节头 */
+        st.u32Seq  = (HI_U32)seq++;
+
+        if (HI_MPI_ADEC_SendStream(0, &st, HI_TRUE) == 0) sent++; else fail++;
+
+        usleep(23000);
+        off += PB_DIRECT_PKT;
+    }
+
+    if (fail) logf_("[pb] direct send: ok=%d fail=%d", sent, fail);
+
+    /* 一段全失败说明通道根本不可用（复用假设不成立）——永久回退到 rmm，
+       避免一直静音。只在"一包都没成功"时才降级。 */
+    if (sent == 0 && fail > 0) {
+        g_adec_ok = 0;
+        logf_("[pb] direct ADEC 不可用，永久回退 rmm 播放");
+    }
+    free(j->data);
+    free(j);
+    g_pb_direct_busy = 0;
+    return NULL;
+}
+
+/* 触发播放：把 PB_LINK 指向的段文件整段读进来，交给发包线程。
+ * 返回 0 表示已经开始播（不等待播完），语义与原来的 mq_send 一致。 */
+static int pb_trigger(void)
+{
+    struct stat    sb;
+    struct pb_job *j;
+    pthread_t      th;
+    int            fd, n, got;
+
+    if (!g_adec_ok) return pb_trigger_via_rmm();
+
+    if (g_pb_direct_busy) {
+        logf_("[pb] direct busy, drop trigger");
+        return -1;
+    }
+
+    fd = open(PB_LINK, O_RDONLY);
+    if (fd < 0) {
+        logf_("[pb] open %s failed errno=%d", PB_LINK, errno);
+        return -1;
+    }
+    if (fstat(fd, &sb) != 0 || sb.st_size <= 0) {
+        close(fd);
+        logf_("[pb] %s size invalid", PB_LINK);
+        return -1;
+    }
+    n = (int)sb.st_size;
+    if (n > PB_DIRECT_MAX) n = PB_DIRECT_MAX;
+
+    j = (struct pb_job *)malloc(sizeof(*j));
+    if (!j) { close(fd); return -1; }
+    j->data = (unsigned char *)malloc(n);
+    if (!j->data) { free(j); close(fd); return -1; }
+
+    got = (int)read(fd, j->data, n);
+    close(fd);
+    if (got != n) {
+        free(j->data); free(j);
+        logf_("[pb] read %s short (%d/%d)", PB_LINK, got, n);
+        return -1;
+    }
+    j->len = n;
+
+    g_pb_direct_busy = 1;
+    if (pthread_create(&th, NULL, pb_direct_thread, j) != 0) {
+        g_pb_direct_busy = 0;
+        free(j->data); free(j);
+        logf_("[pb] pthread_create failed errno=%d", errno);
+        return -1;
+    }
+    pthread_detach(th);
     return 0;
 }
 

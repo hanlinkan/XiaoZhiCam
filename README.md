@@ -135,10 +135,11 @@ fi
 「别人的相机一个字节都不用改 flash」的原因。只有被手工改过（比如把 `/home/rmm`
 换成指向 SD 的符号链接）的机器，才需要先把原版写回去。
 
-**彻底还原一台被改过的机器**（原版二进制在卡上 `hack/bin/rmm_orig`）：
+**彻底还原一台被改过的机器**。需要一份原版 `rmm`：早期版本的卡上带
+`hack/bin/rmm_orig`，本仓库因版权原因不分发；没有的话从你自己的相机备份里取。
 
 ```sh
-cp /tmp/hd1/hack/bin/rmm_orig /home/rmm.new && sync
+cp <原版rmm路径> /home/rmm.new && sync
 chmod 755 /home/rmm.new && rm /home/rmm && mv /home/rmm.new /home/rmm && sync
 md5sum /home/rmm          # 期望 ebc2650d4f06d04a070730a8bce0dbc9
 rm /home/forbidden.g726 && mv /home/forbidden.g726.orig /home/forbidden.g726

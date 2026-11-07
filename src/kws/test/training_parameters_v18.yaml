@@ -1,0 +1,118 @@
+# v18 —— 补正样本多样性，目标是把 v17 的 82% 召回拉过 90% 门槛，误报仍守 0
+#
+# v17 判卷（同一份考卷）：TTS 负句误报 83% -> 0%、AISHELL 4% -> 0%，
+# 但留出音色正句召回 88% -> 82%，阈值从 240 降到 100 也只回到 83.3%。
+# 诊断：正样本只有 8 音色 × 4 条文本 × 3 语速，留出音色仅 8 条原始音频；
+# 约 17% 的正句被直接判成最低分 43，且在样本里均匀分布。
+#
+# v18 的两个变量（都指向「召回不足」，判卷时同时验证误报有没有回弹）：
+#   1. 正样本换成 multivoice_v2：11 个音色（zh-CN 8 + zh-TW 3）× 12 条，
+#      文本 / 语速 / 音高 / 音量四维韵律共 216 种组合，每音色抽不同子集；
+#      负句用同一套韵律维度，防止模型学「韵律丰富 = 该醒」。
+#      留出音色用 --holdout-list 显式锁定，和 v17 完全相同，考卷可比。
+#   2. 正样本 sampling_weight 10 -> 12，batch 负样本占比 0.726 -> 0.684。
+#
+# 其余数据（AISHELL 160 人 24.1 h、真机底噪、历史误报实录）与 v17 一致。
+#
+# 路径约定：相对训练时的工作目录 `~/theplace/XiaoZhiCam/mww_data`。
+# ⚠️ features_public_v2/ 下必须备好 validation_ambient / testing_ambient
+# （硬链接 validation/testing 即可），否则 ambient FAP 恒为 0、选模不看误报。
+#
+# 启动：
+#   python verify_training_data.py --config training_parameters_v18.yaml \
+#       --data-root ~/theplace/XiaoZhiCam/mww_data \
+#       --manifest <...>/multivoice_v2/manifest.json,<...>/features_public_v2/manifest.json
+#   ./run_training.sh --config <本文件> --log <train_v18.log>
+
+window_step_ms: 10
+train_dir: ./trained_models/wakeword_v18
+
+features:
+  # 正样本：11 音色（训练 9 / 留出 2）× 12 条 × 6 轮增强
+  - features_dir: ./features_v18_pos
+    sampling_weight: 12.0
+    penalty_weight: 1.0
+    truth: true
+    truncation_strategy: truncate_start
+    type: mmap
+
+  # AISHELL-1 公开语料：160 人 × 120 条，按人分 104/16/40
+  # testing 6.06 h 独立音频；带 RIR 0.3 + 5~20 dB 真机底噪
+  - features_dir: ./features_public_v2
+    sampling_weight: 6.0
+    penalty_weight: 1.0
+    truth: false
+    truncation_strategy: random
+    type: mmap
+
+  # 与正样本同一批音色的不相干句子（v2：同样覆盖四维韵律）
+  - features_dir: ./multivoice_v2/features
+    sampling_weight: 4.0
+    penalty_weight: 1.0
+    truth: false
+    truncation_strategy: random
+    type: mmap
+
+  - features_dir: ./features_v17_noise
+    sampling_weight: 4.0
+    penalty_weight: 1.0
+    truth: false
+    truncation_strategy: random
+    type: mmap
+
+  - features_dir: ./features_v15_cmdmon
+    sampling_weight: 4.0
+    penalty_weight: 1.0
+    truth: false
+    truncation_strategy: random
+    type: mmap
+
+  - features_dir: ./features_v15_livemon
+    sampling_weight: 2.0
+    penalty_weight: 1.0
+    truth: false
+    truncation_strategy: random
+    type: mmap
+
+  - features_dir: ./features_v16_mine
+    sampling_weight: 6.0
+    penalty_weight: 1.0
+    truth: false
+    truncation_strategy: random
+    type: mmap
+
+training_steps:
+  - 12000
+learning_rates:
+  - 0.001
+batch_size: 128
+eval_step_interval: 500
+clip_duration_ms: 1500
+spectrogram_length: 204
+spectrogram_length_final_layer: 50
+stride: 3
+negative_class_weight:
+  - 20
+positive_class_weight:
+  - 1
+target_minimization: 2.0
+minimization_metric: ambient_false_positives_per_hour
+maximization_metric: average_viable_recall
+
+flags:
+  model_name: mixednet
+  first_conv_filters: 32
+  first_conv_kernel_size: 5
+  pointwise_filters: 64,64,64,64
+  mixconv_kernel_sizes: '[5], [7,11], [9,15], [23]'
+  repeat_in_block: 1, 1, 1, 1
+  residual_connection: 0,0,0,0
+  max_pool: 0
+  spatial_attention: 0
+  pooled: 0
+  restore_checkpoint: 0
+  test_tf_nonstreaming: 0
+  test_tflite_nonstreaming: 0
+  test_tflite_nonstreaming_quantized: 0
+  test_tflite_streaming: 0
+  test_tflite_streaming_quantized: 1

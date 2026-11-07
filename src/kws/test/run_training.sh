@@ -2,7 +2,8 @@
 # 启动 wakeword v17 训练（开发机上跑）。
 #
 #   ./run_training.sh --smoke     # 20 步冒烟，只验证链路，产物在 /tmp
-#   ./run_training.sh             # 正式训练 12000 步 + 量化流式模型评估
+#   ./run_training.sh             # 正式训练（默认 v17 配置）
+#   ./run_training.sh --config <v18.yaml> --log <v18.log>
 #   ./run_training.sh --steps 3000 --no-eval
 #
 # 两个历史坑在这里统一处理：
@@ -33,6 +34,7 @@ while [ $# -gt 0 ]; do
     --eval-interval) EVAL_INTERVAL=$2; shift 2 ;;
     --no-eval) TEST_QUANT=0; shift ;;
     --log) LOG=$2; LOG_SET=1; shift 2 ;;
+    --config) CONFIG=$2; shift 2 ;;
     -h|--help) usage ;;
     *) echo "未知参数: $1" >&2; usage ;;
   esac
@@ -44,7 +46,7 @@ if [ "$SMOKE" = 1 ]; then
   EVAL_INTERVAL=${EVAL_INTERVAL:-5}
   TEST_QUANT=0
   [ "$LOG_SET" = 1 ] || LOG=/tmp/train_v17_smoke.log
-  CFG=/tmp/training_parameters_v17_smoke.yaml
+  CFG=/tmp/$(basename "$CONFIG" .yaml)_smoke.yaml
   "$PY" - "$CONFIG" "$CFG" "$STEPS" "$TRAIN_DIR" "$EVAL_INTERVAL" <<'PY'
 import sys, yaml
 src, dst, steps, train_dir, interval = sys.argv[1:6]

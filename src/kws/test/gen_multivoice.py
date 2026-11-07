@@ -8,6 +8,9 @@
     分布不一致，模型会走捷径学音色而不是学词。
   * 仍是合成域：离线考卷用「留出未参与训练的 AI 音色 + AISHELL 留出说话人」，
     与训练零交集；全程不需要真人录音。
+  * v18 扩充：文本 / 语速 / 音高 / 音量四维韵律组合，正负样本用**同一套**维度，
+    避免模型靠「韵律丰富 = 该醒」偷懒；`--holdout-list` 可锁定留出音色，
+    保证跨版本判卷用的是同一批「没见过的人」。
 
 产出：
   out/positive/<voice>/pNNN.wav   1.8 s，词从开头（供 gen_features_deploy.py）
@@ -20,9 +23,12 @@
 
 用法：
   ~/miniconda3/envs/mww/bin/python gen_multivoice.py \
-      --out ~/theplace/XiaoZhiCam/mww_data/multivoice_v1 --pos-per-voice 6 --neg-per-voice 24
+      --out ~/theplace/XiaoZhiCam/mww_data/multivoice_v2 \
+      --locales zh-CN,zh-TW --pos-per-voice 12 --neg-per-voice 12 \
+      --holdout-list zh-CN-liaoning-XiaobeiNeural,zh-CN-shaanxi-XiaoniNeural \
+      --negative-features
 
-  冒烟：--voices 2 --pos-per-voice 1 --neg-per-voice 1 --out /tmp/mv_smoke
+  冒烟：--voice-count 2 --pos-per-voice 1 --neg-per-voice 1 --out /tmp/mv_smoke
 """
 import argparse
 import asyncio
@@ -38,7 +44,11 @@ import corpus_common as cc  # noqa: E402
 
 DEFAULT_MWW = "~/theplace/XiaoZhiCam/mww_data"
 
-POS_TEXTS = ["你好小智", "你好小智。", "你好，小智", "你好小智？"]
+# 只变标点和停顿，唤醒词本体一字不改 —— 换词序会换掉标签语义
+POS_TEXTS = [
+    "你好小智", "你好小智。", "你好，小智", "你好小智？",
+    "你好小智！", "你好 小智", "你好，小智。", "你好，小智？",
+]
 
 NEG_TEXTS = [
     "现在几点了", "几点了", "今天几号", "明天星期几", "今天天气怎么样",
@@ -54,6 +64,14 @@ NEG_TEXTS = [
 ]
 
 RATES = ["-10%", "+0%", "+10%"]
+PITCHES = ["-20Hz", "+0Hz", "+20Hz"]
+VOLUMES = ["-10%", "+0%", "+10%"]
+
+# 8 文本 × 3 语速 × 3 音高 × 3 音量 = 216 种确定性组合，
+# 每个说话人各抽一组不重复的子集，覆盖比 v17 的「4 文本 × 3 语速」宽得多。
+def prosody_combos():
+    return [(t, r, p, v) for t in POS_TEXTS
+            for r in RATES for p in PITCHES for v in VOLUMES]
 
 
 def trim_leading_silence(x, thresh=0.008, frame=160):
@@ -71,12 +89,14 @@ def fit_positive(x, seconds=1.8):
     return np.pad(x, (0, n - len(x)))
 
 
-async def tts_bytes(text, voice, rate, retries=3, timeout=60):
+async def tts_bytes(text, voice, rate, pitch="+0Hz", volume="+0%",
+                    retries=3, timeout=60):
     import edge_tts
     last = None
     for attempt in range(retries):
         try:
-            comm = edge_tts.Communicate(text, voice, rate=rate)
+            comm = edge_tts.Communicate(text, voice, rate=rate,
+                                       volume=volume, pitch=pitch)
             buf = bytearray()
 
             async def collect():
@@ -91,14 +111,16 @@ async def tts_bytes(text, voice, rate, retries=3, timeout=60):
         except Exception as e:
             last = e
         await asyncio.sleep(1.5 * (attempt + 1))
-    raise RuntimeError("TTS 失败 %s/%s rate=%s: %s" % (voice, text, rate, last))
+    raise RuntimeError("TTS 失败 %s/%s rate=%s pitch=%s vol=%s: %s" %
+                       (voice, text, rate, pitch, volume, last))
 
 
-async def available_voices():
+async def available_voices(locales):
     import edge_tts
     vs = await edge_tts.list_voices()
-    zh = [v["ShortName"] for v in vs if v.get("Locale", "").startswith("zh-CN")]
-    return sorted(set(zh))
+    names = [v["ShortName"] for v in vs
+             if any(v.get("Locale", "").startswith(loc) for loc in locales)]
+    return sorted(set(names))
 
 
 def voice_tag(name):
@@ -112,10 +134,23 @@ async def generate(args, voices):
     os.makedirs(pos_root, exist_ok=True)
     os.makedirs(neg_root, exist_ok=True)
     rng = np.random.default_rng(args.seed)
-    holdout = set(voices[len(voices) - args.holdout_voices:]) if args.holdout_voices else set()
+    if args.holdout_list:
+        holdout = {v.strip() for v in args.holdout_list.split(",") if v.strip()}
+        missing = sorted(holdout - set(voices))
+        if missing:
+            raise SystemExit("留出音色不在可用列表里: %s" % missing)
+    elif args.holdout_voices:
+        holdout = set(voices[len(voices) - args.holdout_voices:])
+    else:
+        holdout = set()
     manifest = {"voices": voices, "heldout_voices": sorted(holdout),
-                "rates": RATES, "seed": args.seed,
+                "locales": args.locales, "rates": RATES, "pitches": PITCHES,
+                "volumes": VOLUMES, "seed": args.seed,
                 "pos_texts": POS_TEXTS, "neg_texts": NEG_TEXTS, "files": []}
+
+    combos = prosody_combos()
+    if args.pos_per_voice > len(combos):
+        raise SystemExit("--pos-per-voice 不能超过韵律组合数 %d" % len(combos))
 
     for vi, voice in enumerate(voices):
         split_tag = "heldout" if voice in holdout else "train"
@@ -125,40 +160,45 @@ async def generate(args, voices):
         os.makedirs(pd, exist_ok=True)
         os.makedirs(nd, exist_ok=True)
 
-        # 正样本：每人 pos-per-voice 条，轮换文本与语速
-        for k in range(args.pos_per_voice):
+        # 每个说话人抽一组不同的韵律组合，避免所有人的「你好小智」都一个味儿
+        picks = rng.permutation(len(combos))[:args.pos_per_voice]
+        for k, ci in enumerate(picks):
+            text, rate, pitch, volume = combos[int(ci)]
             rel = os.path.join(tag, "p%03d.wav" % k)
             path = os.path.join(pos_root, rel)
-            text = POS_TEXTS[k % len(POS_TEXTS)]
-            rate = RATES[(k // len(POS_TEXTS)) % len(RATES)]
+            rec = {"path": "positive/" + rel, "voice": voice, "label": 1,
+                   "text": text, "rate": rate, "pitch": pitch, "volume": volume,
+                   "split": split_tag}
             if args.resume and os.path.isfile(path):
-                manifest["files"].append({"path": "positive/" + rel, "voice": voice,
-                                         "label": 1, "text": text, "rate": rate, "split": split_tag})
+                manifest["files"].append(rec)
                 continue
-            data = await tts_bytes(text, voice, rate)
+            data = await tts_bytes(text, voice, rate, pitch, volume)
             audio = fit_positive(cc.decode_audio_bytes(data))
             cc.write_wav16k(path, audio)
-            manifest["files"].append({"path": "positive/" + rel, "voice": voice,
-                                     "label": 1, "text": text, "rate": rate, "split": split_tag})
-            print("  + %s p%03d  %s" % (tag, k, text))
+            manifest["files"].append(rec)
+            print("  + %s p%03d %s r=%s p=%s v=%s" %
+                  (tag, k, text, rate, pitch, volume))
 
-        # 负样本：同一批音色，说不相干的句子
+        # 负样本：同一批音色 + 同样的韵律维度，防止模型靠「韵律丰富=正样本」偷懒
         texts = list(NEG_TEXTS)
         rng.shuffle(texts)
         for k in range(args.neg_per_voice):
             rel = os.path.join(tag, "n%03d.wav" % k)
             path = os.path.join(neg_root, rel)
             text = texts[k % len(texts)]
-            rate = RATES[(k // len(texts) + 1) % len(RATES)] if len(RATES) else "+0%"
+            rate = RATES[(k // len(texts) + 1) % len(RATES)]
+            pitch = PITCHES[(k // len(RATES)) % len(PITCHES)]
+            volume = VOLUMES[(k // (len(RATES) * len(PITCHES))) % len(VOLUMES)]
+            rec = {"path": "negative/" + rel, "voice": voice, "label": 0,
+                   "text": text, "rate": rate, "pitch": pitch, "volume": volume,
+                   "split": split_tag}
             if args.resume and os.path.isfile(path):
-                manifest["files"].append({"path": "negative/" + rel, "voice": voice,
-                                         "label": 0, "text": text, "rate": rate, "split": split_tag})
+                manifest["files"].append(rec)
                 continue
-            data = await tts_bytes(text, voice, rate)
+            data = await tts_bytes(text, voice, rate, pitch, volume)
             audio = cc.decode_audio_bytes(data)
             cc.write_wav16k(path, audio)
-            manifest["files"].append({"path": "negative/" + rel, "voice": voice,
-                                     "label": 0, "text": text, "rate": rate, "split": split_tag})
+            manifest["files"].append(rec)
             print("  - %s n%03d  %s" % (tag, k, text))
         print("[%d/%d] %s 完成" % (vi + 1, len(voices), tag))
 
@@ -231,10 +271,14 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--out", required=True, help="输出根目录")
-    ap.add_argument("--voices", default="", help="逗号分隔的 edge-tts 音色名；留空=全部 zh-CN")
+    ap.add_argument("--voices", default="", help="逗号分隔的 edge-tts 音色名；留空按 --locales 取")
+    ap.add_argument("--locales", default="zh-CN",
+                    help="逗号分隔的 locale 前缀，如 zh-CN,zh-TW（zh-HK 是粤语，不建议做正样本）")
     ap.add_argument("--voice-count", type=int, default=0, help="只用前 N 个音色（冒烟用）")
     ap.add_argument("--holdout-voices", type=int, default=2,
                     help="末尾 N 个音色留作考卷，只进 testing，不进训练")
+    ap.add_argument("--holdout-list", default="",
+                    help="显式指定留出音色（逗号分隔）；跨版本对比时必须用它锁定同一批人")
     ap.add_argument("--pos-per-voice", type=int, default=6)
     ap.add_argument("--neg-per-voice", type=int, default=24)
     ap.add_argument("--seed", type=int, default=1234)
@@ -248,8 +292,9 @@ def main():
     ap.add_argument("--snr-max", type=float, default=20.0, help="负句叠真机底噪 SNR 上限 dB")
     args = ap.parse_args()
 
+    locales = [x.strip() for x in args.locales.split(",") if x.strip()]
     voices = ([v.strip() for v in args.voices.split(",") if v.strip()]
-              if args.voices else asyncio.run(available_voices()))
+              if args.voices else asyncio.run(available_voices(locales)))
     if not voices:
         raise SystemExit("没有可用的中文音色")
     if args.voice_count:

@@ -219,3 +219,10 @@ python gen_multivoice.py --out <multivoice_v1> \
 
 第一批全量数据（开发机实测，27 s）：AISHELL 50 说话人 × 60 条 → 4688 个窗口，
 按人分为 training 34 人 / 3243、validation 8 人 / 714、testing 8 人 / 731。
+多音色第一批（302 s）：8 音色 × 4 正 + 12 负 = 128 个 WAV，
+负句特征 training 51 / validation 10 / testing 23（留出音色，与训练零交集）。
+
+**重训前仍缺**：正样本 WAV 散落在 `positive/<voice>/` 子目录，需摊平后经
+`gen_features_deploy.py` 生成特征；旧 v9/v12/v13 特征目录需按新链路重建；
+`training_parameters_v17.yaml` 尚未建立。这三件做完并让 `verify_training_data.py`
+全绿，才具备重训条件。

@@ -139,3 +139,49 @@ train / val / test。只缺一个批量适配器脚本。
 **正样本用 AI 生成多音色是可行的**，但有个前提：让**同一批音色既说「你好小智」
 也说一堆不相干句子**。否则正负样本的音色分布不一致，模型仍会学音色捷径。
 另外测试集必须包含训练里完全没见过的真人，不能全是 AI 自己考自己。
+
+---
+
+## 六、已落地的工具（2026-11-07）
+
+`src/kws/test/` 下三个脚本，负责把第五章的资产变成可训练素材，**不动固件**：
+
+| 脚本 | 作用 |
+|---|---|
+| `corpus_common.py` | 公共模块：16k WAV 读写、RIR 卷积、真机底噪叠加、固件 C 链路特征、变长窗口、按说话人分组、RaggedMmap 输出、MP3 解码 |
+| `prepare_public_corpus.py` | 流式读 AISHELL-1 外层 tgz → 多说话人**负样本特征**，按说话人切 train/val/test |
+| `gen_multivoice.py` | edge-tts 多个 zh-CN 音色，**同一批音色**既生成「你好小智」也生成不相干句子；`--negative-features` 可直接产负句特征 |
+
+设计约束：
+
+- 特征一律走 `libkwsfeat.so`（`make libkwsfeat.so` 本地构建，`.gitignore` 忽略、不入库）；
+  可用 `KWSFEAT_LIB` 指向别处已编好的那份
+- 真机底噪显式传 `--noise`，不依赖历史 `~/mww_data` 软链
+- MP3 解码用开发机资产清单 §5 登记的 `~/bin/ffmpeg`；它不在非交互 ssh 的 PATH 里，
+  按清单 §2 用 `bash -lc` 探测，**不能用 `which` 单点判断**
+- RIR / 背景噪声增强默认关闭：`gen_features_deploy.py` 的 Augmentation 自带
+  RIR(0.5) 与背景噪声(0.75)，避免双重增强
+- 窗口变长（≥150 帧），用 pickle 缓存 + RaggedMmap 输出，支持 `--resume`；
+  所有随机性来自 `--seed`，`manifest.json` 记录参数、说话人分组与文件清单
+
+```bash
+# 本机先构建特征库（不入库）
+make -C src/kws/test libkwsfeat.so
+
+# 多说话人负样本（冒烟用 3 人 × 5 条）
+python prepare_public_corpus.py \
+  --aishell <AISHELL-1 tgz> --out <features_public_v1> \
+  --speakers 20 --per-speaker 40 --seed 1234 --resume
+
+# 多音色正负句（冒烟用 --voice-count 3 --pos-per-voice 1 --neg-per-voice 2）
+python gen_multivoice.py --out <multivoice_v1> \
+  --pos-per-voice 6 --neg-per-voice 24 --negative-features
+```
+
+**正样本 WAV 交给 `gen_features_deploy.py`**（它负责标签对齐与增强）；
+负样本特征可直接作为训练配置里的 `features_dir`。
+测试集里必须另外放训练中完全没见过的真人录音，否则仍是自己考自己。
+
+冒烟验证（开发机实测）：AISHELL 3 人 × 5 条 → 28 个窗口、按人分到 3 个 split，
+特征 `(309, 40)` float32、值域 0~23.5；3 音色 × 1 正 2 负 → 9 个 WAV +
+3 个 split 的负句特征（变长 168~196 帧），均可被 `RaggedMmap` 正常读出。

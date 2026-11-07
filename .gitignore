@@ -48,6 +48,9 @@ __pycache__/
 venv/
 *.egg-info/
 
+# ---- 训练研究方法文档：过程性笔记，仅本地维护、不入库 ----
+docs/wakeword-retrain-guide.md
+
 video/
 .workbuddy/
 

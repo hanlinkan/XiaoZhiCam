@@ -411,7 +411,6 @@ make ref && make verify                   # 逐位一致性校验（需自备两
 | 文档 | 内容 |
 |---|---|
 | [`docs/audio-playback.md`](docs/audio-playback.md) | **如何自己驱动喇叭发声**（不经过 `rmm`）：CPLD 功放开关、ADEC 送流的包格式与 `0xA0188040` 的真相、两条无效路径、`/proc/umap` 字段的正确读法 |
-| [`docs/wakeword-retrain-guide.md`](docs/wakeword-retrain-guide.md) | **重训唤醒词模型之前要先建立什么**：数据断言、同分布评测、固定回归集与量化门槛、真机误报留证与回流 |
 
 配套的验证程序都在 `src/tests/` 下（`p36_cpld.c` 是最小可用示例，
 `make p36_cpld MPP_SDK=/opt/mpp` 即可构建，不参与 `make all`）。

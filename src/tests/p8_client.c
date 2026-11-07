@@ -306,6 +306,72 @@ static void load_identity(void)
           dev_set ? "本机" : "默认值");
 }
 
+/* 唤醒门控热机期（ms）。默认 60 s，可由 SD 卡 hack/wake.conf 或环境变量覆盖，
+ * 见下面的 load_wake_gate()。定义在函数之前，避免声明顺序依赖。 */
+#define WAKE_GATE_DEFAULT_MS  60000L
+#define WAKE_GATE_MAX_MS      600000L
+static long g_wake_gate_ms = WAKE_GATE_DEFAULT_MS;
+
+/*
+ * 唤醒门控热机期（毫秒）。
+ *
+ * 由来：开机阶段 afe 电平归一化 / KWS 底噪估计尚未收敛，容易误报
+ * （docs/09 §五、§八：v16 仍留 1 FP@253 启动瞬态）。早期用硬编码 180000 ms
+ * 整段挡掉，代价是每次上电要等 3 分钟——真机排查时很容易误判成"唤不醒"。
+ * docs/12 §4 当年就建议降到 60 s：门控外的误报只是多听一轮、不会误答，
+ * 「宁可多听，不可不答」。这里把默认值改成 60 s 并做成配置项。
+ *
+ * 优先级：环境变量 WAKE_GATE_MS > SD 卡 hack/wake.conf > 默认 60000。
+ * 有效范围 0 ~ 600000；设 0 = 关闭门控，上电立即可唤醒（调试用）。
+ * 只影响"命中是否放行"：门控期内 KWS 照常检测、照常打 HIT 日志。
+ */
+static void load_wake_gate(void)
+{
+    static const char *conf_paths[] = {
+        "/tmp/hd1/hack/wake.conf",
+        "/tmp/hd1/wake.conf",
+        NULL
+    };
+    const char *src = "default";
+    const char *env;
+    char line[128];
+    int i;
+
+    env = getenv("WAKE_GATE_MS");
+    if (env) {
+        char *end = NULL;
+        long v = strtol(env, &end, 10);
+        if (end != env && v >= 0 && v <= WAKE_GATE_MAX_MS) {
+            g_wake_gate_ms = v;
+            src = "env";
+        } else {
+            logf_("[kws] 忽略非法 WAKE_GATE_MS=%s", env);
+        }
+    } else {
+        for (i = 0; conf_paths[i]; i++) {
+            FILE *f = fopen(conf_paths[i], "r");
+            if (!f) continue;
+            while (fgets(line, sizeof line, f)) {
+                char *end = NULL;
+                long v;
+                line[strcspn(line, "\r\n")] = '\0';
+                if (line[0] == '#' || line[0] == '\0') continue;
+                if (strncmp(line, "WAKE_GATE_MS=", 13)) continue;
+                v = strtol(line + 13, &end, 10);
+                if (end == line + 13 || v < 0 || v > WAKE_GATE_MAX_MS) {
+                    logf_("[kws] 忽略非法 %s", line);
+                    continue;
+                }
+                g_wake_gate_ms = v;
+                src = conf_paths[i];
+            }
+            fclose(f);
+            break;
+        }
+    }
+    logf_("[kws] wake gate = %ld ms (%s)", g_wake_gate_ms, src);
+}
+
 /* ===================== 环形缓冲（单生产/单消费） ===================== */
 
 typedef struct {
@@ -772,12 +838,11 @@ static void *th_cap(void *arg)
                               d.rel_db10 / 10.0, d.floor_db10 / 10.0);
                         kws_arm(0);      /* 一次发声只报一次；不动前端（见 kws.c） */
                         /* 唤醒门控：IDLE（或正在重连）态、且本进程已过热机期才放行。
-                         * 实测误报全部集中在进程启动后前 4 分钟（afe 电平归一化 /
-                         * 底噪估计未收敛，docs/09 八与补记七），3 分钟后零误报。
+                         * 热机期由 load_wake_gate() 决定（默认 60 s，卡上 wake.conf 可改）；
                          * CONNECTING 也算：60 s 空闲断连的重连窗口里喊唤醒词，
                          * 命中要能留住，等 session 起来立刻开监听。 */
                         if ((g_sm_state == ST_IDLE || g_sm_state == ST_CONNECTING) &&
-                            (now_ms() - g_boot_ms) > 180000) {
+                            (now_ms() - g_boot_ms) > g_wake_gate_ms) {
                             g_wake_hit = 1;
                         }
                     }
@@ -2709,6 +2774,7 @@ int main(void)
     g_log = fopen("/tmp/hd1/client.log", "w");
     if (!g_log) g_log = fopen("/tmp/client.log", "w");
     load_identity();
+    load_wake_gate();
     /* 只解析并打印身份后退出：用于确认 Device-Id 是否取到了本机 MAC，
      * 不碰音频/网络，可以随时运行（ID_ONLY=1 ./p8s）。 */
     if (getenv("ID_ONLY")) return 0;

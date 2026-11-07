@@ -267,8 +267,8 @@ sdcard/               ★ 卡上的全部内容，拷到 SD 卡根目录就生�
 README.md             ★ 本文件（打包时会一并放进 zip）
 
 src/tests/
-  p8_client.c         ★ 主程序源码（2913 行，设备上以 p8s 运行）
-  p0…p27_*.c          硬件探针：开发过程中逐个摸清音频/codec/看门狗的小程序
+  p8_client.c         ★ 主程序源码（3118 行，设备上以 p8s 运行）
+  p0…p36_*.c          硬件探针：开发过程中逐个摸清音频/codec/看门狗的小程序
   wd_*.c              看门狗接管实验
   Makefile            全部目标的构建规则
 src/kws/              唤醒词引擎（独立可测）
@@ -389,7 +389,8 @@ make ref && make verify                   # 逐位一致性校验（需自备两
 |---|---|
 | [`docs/audio-playback.md`](docs/audio-playback.md) | **如何自己驱动喇叭发声**（不经过 `rmm`）：CPLD 功放开关、ADEC 送流的包格式与 `0xA0188040` 的真相、两条无效路径、`/proc/umap` 字段的正确读法 |
 
-配套的验证程序都在 `src/tests/` 下（`p36_cpld.c` 是最小可用示例）。
+配套的验证程序都在 `src/tests/` 下（`p36_cpld.c` 是最小可用示例，
+`make p36_cpld MPP_SDK=/opt/mpp` 即可构建，不参与 `make all`）。
 
 ## 免责声明
 

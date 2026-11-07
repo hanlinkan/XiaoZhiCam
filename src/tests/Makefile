@@ -100,6 +100,21 @@ $(PLAIN_TARGETS): %: %.c
 	@echo "--- built $@ (libc only) ---"
 	@ls -l $@
 
+# 音频播放 / CPLD 专项探针：按需单独 make，不进 all —— 它们只在摸播放通路时用，
+# 没必要让每次全量构建都带上。p36_cpld 是「不经过 rmm 自己驱动喇叭」的最小示例，
+# 完整配方与踩过的坑见 docs/audio-playback.md。
+AUDIO_PROBE_TARGETS := p29_ao_send p30_adec_send p31_ao_beep p32_ao_state \
+                       p33_ao_dac p35_adec_rmm p36_cpld
+PLAIN_PROBE_TARGETS := cpld_sw mqbeep
+
+$(AUDIO_PROBE_TARGETS): %: %.c
+	$(CC) $(CFLAGS) -o $@ $< $(LDFLAGS) $(LDLIBS)
+
+# cpld_sw 只开关 CPLD 那对 GPIO；mqbeep 发 0x1614 触发 rmm 播放。
+# 旧 uClibc 把 mq_* 放在 librt，统一带 -lrt（对纯 libc 目标无害）。
+$(PLAIN_PROBE_TARGETS): %: %.c
+	$(CC) $(CFLAGS) -o $@ $< -lrt
+
 $(OPUS_TARGETS): %: %.c
 	$(CC) $(CFLAGS) -I$(OPUS_DIR)/include -o $@ $< $(OPUS_DIR)/.libs/libopus.a -lm
 	@echo "--- built $@ (with libopus fixed-point) ---"

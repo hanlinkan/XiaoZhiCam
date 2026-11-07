@@ -6,7 +6,8 @@
     这里用 edge-tts 的多个 zh-CN 音色扩充说话人多样性，成本近乎为零。
   * **同一批音色既说「你好小智」，也说一堆不相干句子**。否则正负样本的音色
     分布不一致，模型会走捷径学音色而不是学词。
-  * 这仍是合成域：测试集必须另外放训练里完全没见过的真人录音。
+  * 仍是合成域：离线考卷用「留出未参与训练的 AI 音色 + AISHELL 留出说话人」，
+    与训练零交集；全程不需要真人录音。
 
 产出：
   out/positive/<voice>/pNNN.wav   1.8 s，词从开头（供 gen_features_deploy.py）
@@ -111,10 +112,13 @@ async def generate(args, voices):
     os.makedirs(pos_root, exist_ok=True)
     os.makedirs(neg_root, exist_ok=True)
     rng = np.random.default_rng(args.seed)
-    manifest = {"voices": voices, "rates": RATES, "seed": args.seed,
+    holdout = set(voices[len(voices) - args.holdout_voices:]) if args.holdout_voices else set()
+    manifest = {"voices": voices, "heldout_voices": sorted(holdout),
+                "rates": RATES, "seed": args.seed,
                 "pos_texts": POS_TEXTS, "neg_texts": NEG_TEXTS, "files": []}
 
     for vi, voice in enumerate(voices):
+        split_tag = "heldout" if voice in holdout else "train"
         tag = voice_tag(voice)
         pd = os.path.join(pos_root, tag)
         nd = os.path.join(neg_root, tag)
@@ -129,13 +133,13 @@ async def generate(args, voices):
             rate = RATES[(k // len(POS_TEXTS)) % len(RATES)]
             if args.resume and os.path.isfile(path):
                 manifest["files"].append({"path": "positive/" + rel, "voice": voice,
-                                         "label": 1, "text": text, "rate": rate})
+                                         "label": 1, "text": text, "rate": rate, "split": split_tag})
                 continue
             data = await tts_bytes(text, voice, rate)
             audio = fit_positive(cc.decode_audio_bytes(data))
             cc.write_wav16k(path, audio)
             manifest["files"].append({"path": "positive/" + rel, "voice": voice,
-                                     "label": 1, "text": text, "rate": rate})
+                                     "label": 1, "text": text, "rate": rate, "split": split_tag})
             print("  + %s p%03d  %s" % (tag, k, text))
 
         # 负样本：同一批音色，说不相干的句子
@@ -148,13 +152,13 @@ async def generate(args, voices):
             rate = RATES[(k // len(texts) + 1) % len(RATES)] if len(RATES) else "+0%"
             if args.resume and os.path.isfile(path):
                 manifest["files"].append({"path": "negative/" + rel, "voice": voice,
-                                         "label": 0, "text": text, "rate": rate})
+                                         "label": 0, "text": text, "rate": rate, "split": split_tag})
                 continue
             data = await tts_bytes(text, voice, rate)
             audio = cc.decode_audio_bytes(data)
             cc.write_wav16k(path, audio)
             manifest["files"].append({"path": "negative/" + rel, "voice": voice,
-                                     "label": 0, "text": text, "rate": rate})
+                                     "label": 0, "text": text, "rate": rate, "split": split_tag})
             print("  - %s n%03d  %s" % (tag, k, text))
         print("[%d/%d] %s 完成" % (vi + 1, len(voices), tag))
 
@@ -178,16 +182,34 @@ def build_negative_features(args, out_root, manifest):
             print("  [warn] %s: %s" % (path, e), file=sys.stderr)
             continue
         by_voice.setdefault(rec["voice"], []).extend(wins)
-    names = sorted(by_voice)
-    if len(names) < 3:
-        print("[warn] 只有 %d 个音色，跳过按音色分组的特征输出" % len(names))
-        return
-    groups = cc.speaker_groups(names, args.seed)
+    holdout = set(manifest.get("heldout_voices", []))
+    train_names = sorted(v for v in by_voice if v not in holdout)
+    test_names = sorted(v for v in by_voice if v in holdout)
     feat_root = os.path.join(out_root, "features")
-    for split, vs in groups.items():
-        ws = [w for v in vs for w in by_voice.get(v, [])]
+
+    if test_names:
+        # 考卷只由「留出音色」组成，与训练音色零交集；全程无真人录音
+        rng2 = np.random.default_rng(args.seed)
+        shuffled = list(train_names)
+        rng2.shuffle(shuffled)
+        n_val = max(1, len(shuffled) // 5) if len(shuffled) > 1 else 0
+        splits = {
+            "training": [w for v in shuffled[n_val:] for w in by_voice[v]],
+            "validation": [w for v in shuffled[:n_val] for w in by_voice[v]],
+            "testing": [w for v in test_names for w in by_voice[v]],
+        }
+    else:
+        if len(train_names) < 3:
+            print("[warn] 只有 %d 个音色，跳过按音色分组的特征输出" % len(train_names))
+            return
+        groups = cc.speaker_groups(train_names, args.seed)
+        splits = {s: [w for v in vs for w in by_voice.get(v, [])]
+                  for s, vs in groups.items()}
+
+    for split, ws in splits.items():
         n = cc.write_split(feat_root, split, ws)
-        print("features/%-10s: %d 音色 / %d 窗口" % (split, len(vs), n))
+        note = "  [留出音色]" if split == "testing" and test_names else ""
+        print("features/%-10s: %d 窗口%s" % (split, n, note))
 
 
 def main():
@@ -196,6 +218,8 @@ def main():
     ap.add_argument("--out", required=True, help="输出根目录")
     ap.add_argument("--voices", default="", help="逗号分隔的 edge-tts 音色名；留空=全部 zh-CN")
     ap.add_argument("--voice-count", type=int, default=0, help="只用前 N 个音色（冒烟用）")
+    ap.add_argument("--holdout-voices", type=int, default=2,
+                    help="末尾 N 个音色留作考卷，只进 testing，不进训练")
     ap.add_argument("--pos-per-voice", type=int, default=6)
     ap.add_argument("--neg-per-voice", type=int, default=24)
     ap.add_argument("--seed", type=int, default=1234)
